@@ -1,0 +1,8 @@
+.work/
+.tmp/
+coverage/
+node_modules/
+npm-debug.log*
+*.local
+*.vault
+*.pcp-export

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Release with Provenance"
+  short_description: "Qualify observed high-risk lifecycle facts"
+  default_prompt: "Use $release-with-provenance to record and qualify this observed lifecycle event without authorizing execution or overstating its status."
+policy:
+  allow_implicit_invocation: false

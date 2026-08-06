@@ -1,0 +1,20 @@
+{
+  "name": "project-context-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first project context recovery and traceable agent run protocol",
+  "type": "module",
+  "bin": {
+    "contextctl": "./skills/project-context-protocol/scripts/contextctl.mjs",
+    "context-adapter": "./skills/project-context-protocol/scripts/context-adapter.mjs"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=spec tests/contextctl-flow.test.mjs tests/contextctl-security.test.mjs tests/contextctl-lifecycle.test.mjs tests/context-adapter.test.mjs",
+    "validate:skills": "node scripts/validate-skills.mjs",
+    "verify": "npm run validate:skills && npm test"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "license": "MIT"
+}
