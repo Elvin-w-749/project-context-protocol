@@ -1,5 +1,7 @@
 # Deterministic routing
 
+Routing starts only after the current user has explicitly selected the absolute Vault path for this session. Routing must never discover or infer a Vault location from archived state, local folders, environment variables, or prior conversations.
+
 Only `project-context-protocol` may be invoked implicitly. After `resume` and a new-session `begin`, call:
 
 ```text

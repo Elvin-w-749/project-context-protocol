@@ -8,12 +8,14 @@ const ADAPTER_VERSION = 'project-context/lifecycle-adapter/v1'
 const HELP = `context-adapter — explicit Agent/Harness lifecycle adapter
 
 Usage:
-  context-adapter session-start --repo <path> --vault <path> [--task <title>] [contextctl begin options]
+  context-adapter session-start --repo <path> --vault <user-selected-absolute-path> --vault-confirmed-by-user [--task <title>] [contextctl begin options]
   context-adapter heartbeat --repo <path> --vault <path> --run <id> --session <token> [--summary <text>]
   context-adapter checkpoint --repo <path> --vault <path> --run <id> --session <token> --event <type> --summary <text> [checkpoint options]
   context-adapter session-stop --repo <path> --vault <path> --run <id> --session <token> [--status partial|blocked|completed] [--summary <text>]
 
 Lifecycle guarantees:
+  Before session-start, the caller must ask the current user where to open or store the Vault.
+  There is no inferred location; missing current-session confirmation stops before any Vault read or write.
   session-start restores state, registers only when --task is supplied for an unmanaged repository,
   begins a fresh authenticated run, routes one mode, and returns a bounded Recovery Card.
   heartbeat is an authenticated observation checkpoint and renews the run lease.
@@ -53,7 +55,21 @@ function requireRunSession(args) {
   assert(args.session && args.session !== true, '--session is required', 'ARGUMENT_REQUIRED')
 }
 
+function requireCurrentSessionVault(args) {
+  assert(
+    args.vault !== undefined && args.vault !== true && String(args.vault).trim() !== '',
+    '--vault is required. Ask the current user where this session may open or store the local Vault.',
+    'VAULT_LOCATION_REQUIRED'
+  )
+  assert(
+    args['vault-confirmed-by-user'] === true,
+    'session-start requires --vault-confirmed-by-user after the current user explicitly selects the exact Vault path',
+    'VAULT_LOCATION_CONFIRMATION_REQUIRED'
+  )
+}
+
 export function sessionStart(args, source = 'lifecycle-command') {
+  requireCurrentSessionVault(args)
   const capture = captureDeclaration(args, source)
   const base = contextArgs(args)
   let restored = COMMANDS.resume({ ...base, json: true })
@@ -84,7 +100,7 @@ export function sessionStart(args, source = 'lifecycle-command') {
     session: begun.session,
     event: routeEvent
   })
-  const recovery = COMMANDS.resume({ repo: base.repo, vault: base.vault, json: true }).card
+  const recovery = COMMANDS.resume({ ...base, json: true }).card
   return {
     command: 'session-start',
     started: true,

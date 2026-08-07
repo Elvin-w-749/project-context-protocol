@@ -208,6 +208,11 @@ function validateSkillMetadata(skillName) {
         fail(`${relative(agentFile)} must define default_prompt exactly once.`)
       } else if (!String(prompt.value).includes(`$${skillName}`)) {
         fail(`${relative(agentFile)} default_prompt must contain $${skillName}.`)
+      } else if (skillName === 'project-context-protocol') {
+        const value = String(prompt.value)
+        if (!/ask me[\s\S]*Vault/i.test(value) || !/explicit absolute path/i.test(value)) {
+          fail(`${relative(agentFile)} default_prompt must ask the current user for an explicit absolute Vault path before recovery.`)
+        }
       }
 
       const implicit = yamlField(raw, 'allow_implicit_invocation')
@@ -323,7 +328,10 @@ function validateDocumentationContracts() {
   requireDocumentContract(coreSkill, [
     ['non-Git v1 support boundary', /Version 1 supports Git worktrees only/i],
     ['non-Git BLOCKED state', /non-Git[^\n]*`BLOCKED`/i],
-    ['degraded and unmanaged manual fallback', /degraded\/unmanaged/i]
+    ['degraded and unmanaged manual fallback', /degraded\/unmanaged/i],
+    ['pre-access current-user Vault question', /Before any Vault command or Vault read[\s\S]{0,500}?ask one concise question[\s\S]{0,200}?pause/i],
+    ['no default or inferred Vault location', /There is no default Vault location/i],
+    ['current-session Vault confirmation flag', /--vault-confirmed-by-user/]
   ])
 
   const stateContract = path.join(SKILLS_DIR, 'project-context-protocol', 'references', 'state-contract.md')

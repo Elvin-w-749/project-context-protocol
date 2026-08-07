@@ -11,6 +11,8 @@ The CLI never uploads vault content. Its only optional network-capable path is a
 
 ## Vault placement
 
+Vault placement is a current-session user choice. There is no platform, drive, home-directory, environment-variable, existing-folder, repository-file, or archived-state fallback. Before any Vault access, obtain one absolute path from the current user; if it is absent or ambiguous, ask and stop. The CLI confirmation flag records this declaration but is not cryptographic proof of human identity.
+
 Canonicalize the vault and repository paths. The first implementation rejects a vault inside the worktree, Git common directory, UNC path, or any detected Git repository; there is no bypass flag. A local hook cannot prevent every Git client or `--no-verify`; describe such sessions as unguarded and scan on the next recovery.
 
 On Windows, the first vault-root creation removes ACL inheritance and grants inheritable Full Control only to the current Windows SID, SYSTEM, and Builtin Administrators before any child directory is created. The CLI then reads the effective root ACL back and fails closed on extra, denied, inherited, missing, or unreadable entries. It does not run a recursive ACL rewrite on every command. An existing non-empty pre-protocol vault without an ACL marker requires an explicit migration rather than an unsafe automatic claim. `.vault-acl.json` stores only status, platform, enforcement state, fingerprint, and check time—not usernames or the ACL rule set. Non-Windows systems report this control as degraded and must not claim equivalent enforcement. ACLs still do not provide encryption; prefer BitLocker or another encrypted volume.

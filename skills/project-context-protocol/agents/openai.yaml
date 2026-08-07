@@ -1,6 +1,6 @@
 interface:
   display_name: "Project Context Protocol"
-  short_description: "Recover trusted project state and record every run"
-  default_prompt: "Use $project-context-protocol to resume this repository and start a traceable run."
+  short_description: "Ask for the Vault, recover state, and record every run"
+  default_prompt: "Use $project-context-protocol. Before reading or writing project context, ask me where this session should open or store the local Vault and wait for an explicit absolute path. Then resume the repository and start a traceable run with that exact path."
 policy:
   allow_implicit_invocation: true

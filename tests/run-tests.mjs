@@ -61,9 +61,15 @@ function parseEmbeddedJson(candidate) {
   }
 }
 
-function cliArguments(command, values) {
+function cliArguments(command, values, options = {}) {
+  const selected = { ...(values || {}) }
+  if (
+    ['resume', 'register', 'begin', 'verify', 'doctor'].includes(command)
+    && options.confirmVault !== false
+    && !Object.hasOwn(selected, 'vault-confirmed-by-user')
+  ) selected['vault-confirmed-by-user'] = true
   const args = [CLI, command]
-  for (const [key, raw] of Object.entries(values || {})) {
+  for (const [key, raw] of Object.entries(selected)) {
     if (raw === undefined || raw === null || raw === false) continue
     args.push(`--${key}`)
     if (raw !== true) args.push(String(raw))
@@ -108,7 +114,7 @@ export function createRepository(directory, files = {}) {
 }
 
 export function cli(command, options = {}) {
-  const args = cliArguments(command, options.args)
+  const args = cliArguments(command, options.args, options)
   const result = spawnSync(process.execPath, args, {
     cwd: options.cwd || PROJECT_ROOT,
     encoding: 'utf8',
@@ -134,7 +140,7 @@ export function cli(command, options = {}) {
 }
 
 export function cliAsync(command, options = {}) {
-  const args = cliArguments(command, options.args)
+  const args = cliArguments(command, options.args, options)
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
       cwd: options.cwd || PROJECT_ROOT,

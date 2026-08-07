@@ -549,6 +549,24 @@ export function withStateLock(paths, callback) {
 export function createRun(paths, stateBundle, observation, options = {}) {
   const runId = assertSafeId(options.runId, 'run ID')
   assert(/^[a-f0-9]{64}$/.test(String(options.sessionNonceHash || '')), 'Run session nonce hash is required', 'RUN_SESSION_REQUIRED')
+  assert(
+    options.vaultSelection?.currentUserSelectionDeclared === true,
+    'Run creation requires a current-session user-confirmed Vault location',
+    'VAULT_LOCATION_CONFIRMATION_REQUIRED'
+  )
+  assert(
+    canonicalPath(options.vaultSelection.path) === canonicalPath(paths.vault),
+    'The confirmed Vault path does not match the active Vault',
+    'VAULT_LOCATION_CONFIRMATION_CONFLICT'
+  )
+  const vaultSelection = {
+    path: paths.vault,
+    currentUserSelectionDeclared: true,
+    declarationScope: options.vaultSelection.declarationScope || 'current-session-explicit-path',
+    operation: options.vaultSelection.operation || 'begin',
+    declarationRecordedAt: options.vaultSelection.declarationRecordedAt || nowIso(),
+    historicalOnly: true
+  }
   const month = new Date().toISOString().slice(0, 7)
   const runDir = ensureDir(path.join(paths.runs, month))
   const runFile = path.join(runDir, `${runId}.json`)
@@ -576,6 +594,7 @@ export function createRun(paths, stateBundle, observation, options = {}) {
     agent: options.agent || 'unspecified-agent',
     harness: options.harness || 'manual-cli',
     captureCoverage: options.captureCoverage || 'observed-and-agent-reported',
+    vaultSelection,
     taskId: stateBundle.state.task?.id || null,
     taskSnapshot: stateBundle.state.task ? JSON.parse(JSON.stringify(stateBundle.state.task)) : null,
     contextReferences: {
@@ -615,7 +634,12 @@ export function createRun(paths, stateBundle, observation, options = {}) {
     next: null,
     scope: null,
     evidence: [],
-    metadata: {},
+    metadata: {
+      vaultPath: vaultSelection.path,
+      currentUserVaultSelectionDeclared: true,
+      declarationScope: vaultSelection.declarationScope,
+      declarationRecordedAt: vaultSelection.declarationRecordedAt
+    },
     previousEventHash: null
   }
   const sealedEvent = sealedRecord(event, 'eventHash')
@@ -623,7 +647,7 @@ export function createRun(paths, stateBundle, observation, options = {}) {
   initialRun.eventSequence = 1
   initialRun.status = 'active'
   const activeRun = saveRunRecord(runFile, initialRun)
-  atomicWrite(runMarkdown, renderRun(activeRun, [sealedEvent]))
+  atomicWrite(runMarkdown, renderRun(activeRun, readEvents(eventDir)))
   return { run: activeRun, runFile, runMarkdown, eventDir }
 }
 
@@ -920,7 +944,10 @@ function renderRun(run, events) {
 - Lease source: ${inlineMarkdown(run.lease?.source || 'not recorded')}
 - Parent run: ${run.parentRunId || 'none'}
 - Recovered from: ${run.recoveredFromRunId || 'none'}
-- Capture coverage: ${run.captureCoverage}
+- Capture coverage: ${run.captureCoverage}${run.vaultSelection ? `
+- Vault: \`${inlineMarkdown(run.vaultSelection.path)}\`
+- Vault selection record: ${run.vaultSelection.currentUserSelectionDeclared ? `${inlineMarkdown(run.vaultSelection.declarationScope)} at ${run.vaultSelection.declarationRecordedAt}; historical after this run boundary` : 'not recorded'}
+` : ''}
 
 ## Start snapshot
 

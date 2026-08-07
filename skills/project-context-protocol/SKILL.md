@@ -1,6 +1,6 @@
 ---
 name: project-context-protocol
-description: Recover trusted local project context and record every Agent run without prescribing the solution method. Use at the start of work in a repository, after context compaction or branch/worktree changes, when resuming interrupted work, when recording project architecture and file structure, and before any other project Skill.
+description: Ask the current user where to open or store the local Vault, then recover trusted project context and record every Agent run without prescribing the solution method. Use at the start of work in a repository, after context compaction or branch/worktree changes, when resuming interrupted work, when recording project architecture and file structure, and before any other project Skill.
 ---
 
 # Project Context Protocol
@@ -9,15 +9,18 @@ Start here for every project session. Keep the model free to choose its diagnost
 
 ## Bootstrap
 
-1. Locate this suite's `scripts/context-adapter.mjs` and `scripts/contextctl.mjs`.
-2. Prefer `context-adapter session-start --repo <working-directory> --vault <local-vault>` as the single entry. Supply `--task` only when registering one confirmed task for an unmanaged repository. If the Harness has no installed lifecycle Hook, retain the adapter's explicit degraded capture declaration.
-3. When the adapter is unavailable, run `contextctl resume --repo <working-directory> --vault <local-vault>` manually.
-4. If the project is unmanaged, run `register`. Resolve `STALE`, `CONFLICT`, or `BLOCKED` before business writes.
-5. For **every new Agent session**, run `begin` before project work, even when the repository is already registered. If an interrupted run exists, use `begin --recover <run_id>` so the new run references it; never silently continue or rewrite it.
-6. Run `contextctl route --event <current-signal> --run <run_id> --session <session_token>`. Accept its one mode and HMAC-authenticated state-bound credential; do not guess among focused Skills.
-7. Read only the Recovery Card and directly referenced current material. Do not load all historical runs. Keep the Recovery Card under the configured bounded budget.
+1. **Before any Vault command or Vault read**, establish one absolute Vault path explicitly selected by the current user in the current conversation. If it is absent, ask one concise question—where this session should open or store the local Vault—and pause until the user answers. Do not inspect likely folders first.
+2. Do not infer the path from a drive, home directory, environment variable, existing folder, repository file, archived state, prior conversation, branch, device, or remembered project convention. Historical paths are evidence only, never current-session selection. There is no default Vault location.
+3. If the user already supplied an absolute path in the current conversation, repeat the exact path you will use before continuing. If the answer is relative or ambiguous, ask for an absolute path and pause. The Vault must remain outside every Git repository and the target worktree.
+4. Locate this suite's `scripts/context-adapter.mjs` and `scripts/contextctl.mjs` without searching or reading the selected Vault.
+5. Prefer `context-adapter session-start --repo <working-directory> --vault <user-selected-absolute-path> --vault-confirmed-by-user` as the single entry. The flag records that this exact path came from the current user; it is not cryptographic proof of identity. Supply `--task` only when registering one confirmed task for an unmanaged repository. If the Harness has no installed lifecycle Hook, retain the adapter's explicit degraded capture declaration.
+6. When the adapter is unavailable, run `contextctl resume --repo <working-directory> --vault <user-selected-absolute-path> --vault-confirmed-by-user` manually, then retain `--vault-confirmed-by-user` on direct `register` and `begin` calls. Never run `resume` until step 1 is complete.
+7. If the project is unmanaged, run `register`. Resolve `STALE`, `CONFLICT`, or `BLOCKED` before business writes.
+8. For **every new Agent session**, run `begin` before project work, even when the repository is already registered. If an interrupted run exists, use `begin --recover <run_id>` so the new run references it; never silently continue or rewrite it.
+9. Run `contextctl route --event <current-signal> --run <run_id> --session <session_token>`. Accept its one mode and HMAC-authenticated state-bound credential; do not guess among focused Skills.
+10. Read only the Recovery Card and directly referenced current material. Do not load all historical runs. Keep the Recovery Card under the configured bounded budget.
 
-Use `H:\ProjectContextVault` as the Windows default only when the user has not configured another local vault. The vault must remain outside the target Git worktree.
+If a Harness cannot obtain a current-user Vault selection, surface `VAULT_LOCATION_CONFIRMATION_REQUIRED` and stop. It must not substitute a configured or previously used path.
 
 Version 1 supports Git worktrees only. A non-Git target is `BLOCKED` for registration and trusted adoption. Continue, if current user authority permits, only as separately reported degraded/unmanaged manual exploration; do not claim `READY`, a valid Recovery Card, protocol verification, or a recoverable handoff.
 
@@ -73,7 +76,7 @@ Only load the selected Skill. The protocol must not force a fixed testing method
 Before returning control:
 
 1. Checkpoint the latest facts, changes, evidence, failures, blockers, and next objective.
-2. Run `contextctl verify`.
+2. Run `contextctl verify --repo <working-directory> --vault <user-selected-absolute-path> --vault-confirmed-by-user`.
 3. Run `contextctl finish --run <run_id> --session <session_token>` with `completed`, `partial`, or `blocked`. This closes the run; it does not infer deployment or acceptance.
 4. Report capture coverage and any out-of-band operations as observed/unattributed.
 

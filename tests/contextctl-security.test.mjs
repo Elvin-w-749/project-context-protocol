@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
+import { renderRun } from '../skills/project-context-protocol/scripts/lib/storage.mjs'
 import {
   cli,
   createRepository,
@@ -24,6 +25,120 @@ function begin(repo, vault, extra = {}) {
 function failureCode(response) {
   return response.json?.error?.code || null
 }
+
+test('Vault access is fail-closed until the current user selects one explicit absolute path', () => {
+  withFixture(({ repo, vault }) => {
+    const missingPath = cli('register', {
+      args: { repo, task: 'Must ask for storage location', json: true },
+      confirmVault: false,
+      allowFailure: true
+    })
+    assert.notEqual(missingPath.status, 0)
+    assert.equal(failureCode(missingPath), 'VAULT_LOCATION_REQUIRED')
+    assert.equal(existsSync(vault), false)
+
+    const whitespacePath = cli('register', {
+      args: { repo, vault: '   ', task: 'Whitespace is not a selected location', json: true },
+      allowFailure: true
+    })
+    assert.notEqual(whitespacePath.status, 0)
+    assert.equal(failureCode(whitespacePath), 'VAULT_LOCATION_REQUIRED')
+    assert.equal(existsSync(vault), false)
+
+    const relativePath = cli('register', {
+      args: { repo, vault: 'relative-vault', task: 'Must use the selected absolute path', json: true },
+      allowFailure: true
+    })
+    assert.notEqual(relativePath.status, 0)
+    assert.equal(failureCode(relativePath), 'VAULT_LOCATION_ABSOLUTE_REQUIRED')
+
+    const missingConfirmation = cli('register', {
+      args: { repo, vault, task: 'Must confirm the storage location', json: true },
+      confirmVault: false,
+      allowFailure: true
+    })
+    assert.notEqual(missingConfirmation.status, 0)
+    assert.equal(failureCode(missingConfirmation), 'VAULT_LOCATION_CONFIRMATION_REQUIRED')
+    assert.equal(missingConfirmation.argv.includes('--vault-confirmed-by-user'), false)
+    assert.equal(existsSync(vault), false)
+
+    const falseStringConfirmation = cli('register', {
+      args: { repo, vault, task: 'A string is not a user confirmation', 'vault-confirmed-by-user': 'false', json: true },
+      confirmVault: false,
+      allowFailure: true
+    })
+    assert.notEqual(falseStringConfirmation.status, 0)
+    assert.equal(failureCode(falseStringConfirmation), 'VAULT_LOCATION_CONFIRMATION_REQUIRED')
+    assert.equal(existsSync(vault), false)
+
+    const registered = cli('register', {
+      args: { repo, vault: `  ${vault}  `, task: 'Record the selected storage location', json: true }
+    }).json
+    const expectedVault = registered.state.vaultSelection.path
+    assert.equal(registered.recovery.vaultSelection.path, expectedVault)
+    assert.equal(registered.recovery.vaultSelection.currentSessionDeclarationRecorded, true)
+    assert.equal(registered.state.vaultSelection.currentUserSelectionDeclared, true)
+    assert.equal(registered.state.vaultSelection.operation, 'register')
+    assert.equal(registered.state.vaultSelection.historicalOnly, true)
+
+    const missingResumeConfirmation = cli('resume', {
+      args: { repo, vault, json: true },
+      confirmVault: false,
+      allowFailure: true
+    })
+    assert.notEqual(missingResumeConfirmation.status, 0)
+    assert.equal(failureCode(missingResumeConfirmation), 'VAULT_LOCATION_CONFIRMATION_REQUIRED')
+    assert.equal(missingResumeConfirmation.argv.includes('--vault-confirmed-by-user'), false)
+
+    for (const command of ['verify', 'doctor']) {
+      const missingReadConfirmation = cli(command, {
+        args: { repo, vault, json: true },
+        confirmVault: false,
+        allowFailure: true
+      })
+      assert.notEqual(missingReadConfirmation.status, 0)
+      assert.equal(failureCode(missingReadConfirmation), 'VAULT_LOCATION_CONFIRMATION_REQUIRED')
+      assert.equal(missingReadConfirmation.argv.includes('--vault-confirmed-by-user'), false)
+    }
+
+    const missingBeginConfirmation = cli('begin', {
+      args: { repo, vault, request: 'Must reconfirm at session start', json: true },
+      confirmVault: false,
+      allowFailure: true
+    })
+    assert.notEqual(missingBeginConfirmation.status, 0)
+    assert.equal(failureCode(missingBeginConfirmation), 'VAULT_LOCATION_CONFIRMATION_REQUIRED')
+    assert.equal(missingBeginConfirmation.argv.includes('--vault-confirmed-by-user'), false)
+    assert.equal(findFiles(vault, (absolute, name) => name.endsWith('.json') && absolute.includes(`${path.sep}runs${path.sep}`)).length, 0)
+
+    const begun = cli('begin', {
+      args: { repo, vault, request: 'Use the current user-selected Vault', json: true }
+    }).json
+    assert.equal(begun.vaultSelection.path, expectedVault)
+    assert.equal(begun.vaultSelection.currentUserSelectionDeclared, true)
+    assert.equal(begun.vaultSelection.operation, 'begin')
+
+    const runFile = findFiles(vault, (absolute, name) => name === `${begun.runId}.json` && absolute.includes(`${path.sep}runs${path.sep}`))[0]
+    const eventFile = findFiles(vault, (absolute, name) => name === '000001.json' && absolute.includes(`${path.sep}${begun.runId}${path.sep}`))[0]
+    assert.ok(runFile)
+    assert.ok(eventFile)
+    assert.deepEqual(parseJsonFile(runFile).vaultSelection, begun.vaultSelection)
+    const sessionStart = parseJsonFile(eventFile)
+    assert.equal(sessionStart.metadata.vaultPath, expectedVault)
+    assert.equal(sessionStart.metadata.currentUserVaultSelectionDeclared, true)
+
+    const immediateVerification = cli('verify', { args: { repo, vault, json: true } }).json
+    assert.equal(immediateVerification.valid, true)
+    assert.equal(immediateVerification.runs.find((item) => item.runId === begun.runId).markdownMatches, true)
+
+    const legacyRun = parseJsonFile(runFile)
+    delete legacyRun.vaultSelection
+    const legacyEvent = { ...sessionStart, metadata: {} }
+    const legacyMarkdown = renderRun(legacyRun, [legacyEvent])
+    assert.doesNotMatch(legacyMarkdown, /^- Vault:/m)
+    assert.match(legacyMarkdown, /- Capture coverage: [^\n]+\n\n## Start snapshot/)
+  })
+})
 
 test('vault paths inside the target or any other Git repository are rejected', () => {
   withFixture(({ root, repo }) => {

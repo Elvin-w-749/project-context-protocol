@@ -22,8 +22,14 @@ function embeddedJson(value) {
 }
 
 function adapter(command, args = {}, options = {}) {
+  const selected = { ...args }
+  if (
+    command === 'session-start'
+    && options.confirmVault !== false
+    && !Object.hasOwn(selected, 'vault-confirmed-by-user')
+  ) selected['vault-confirmed-by-user'] = true
   const argv = [ADAPTER, command]
-  for (const [key, value] of Object.entries(args)) {
+  for (const [key, value] of Object.entries(selected)) {
     if (value === undefined || value === null || value === false) continue
     argv.push(`--${key}`)
     if (value !== true) argv.push(String(value))
@@ -39,7 +45,11 @@ function adapter(command, args = {}, options = {}) {
   if (result.error) throw result.error
   const json = embeddedJson(result.stdout) || embeddedJson(result.stderr)
   if (!options.allowFailure && result.status !== 0) throw new Error(`context-adapter ${command} failed (${result.status}): ${result.stderr || result.stdout}`)
-  return { ...result, json }
+  return { ...result, json, argv: argv.slice(1) }
+}
+
+function vaultSnapshot(vault) {
+  return findFiles(vault, () => true).map((file) => [path.relative(vault, file), readFileSync(file).toString('base64')])
 }
 
 function runRecord(vault, runId) {
@@ -48,12 +58,38 @@ function runRecord(vault, runId) {
   return { file: files[0], value: parseJsonFile(files[0]) }
 }
 
+test('session-start stops before any Vault access without current-user path confirmation', () => {
+  withFixture(({ repo, vault }) => {
+    const result = adapter('session-start', {
+      repo,
+      vault,
+      task: 'Must not start before location confirmation'
+    }, { allowFailure: true, confirmVault: false })
+    assert.notEqual(result.status, 0)
+    assert.equal(result.json.error.code, 'VAULT_LOCATION_CONFIRMATION_REQUIRED')
+    assert.equal(result.argv.includes('--vault-confirmed-by-user'), false)
+    assert.equal(existsSync(vault), false)
+
+    cli('register', { args: { repo, vault, task: 'Historical confirmation must not authorize a new session' } })
+    const before = vaultSnapshot(vault)
+    const historicalOnly = adapter('session-start', {
+      repo,
+      vault
+    }, { allowFailure: true, confirmVault: false })
+    assert.notEqual(historicalOnly.status, 0)
+    assert.equal(historicalOnly.json.error.code, 'VAULT_LOCATION_CONFIRMATION_REQUIRED')
+    assert.equal(Object.hasOwn(historicalOnly.json, 'recovery'), false)
+    assert.deepEqual(vaultSnapshot(vault), before)
+  })
+})
+
 test('session-start fails safely when no unique task can be adopted', () => {
   withFixture(({ repo, vault }) => {
     const result = adapter('session-start', { repo, vault }, { allowFailure: true })
     assert.equal(result.status, 3)
     assert.equal(result.json.started, false)
     assert.equal(result.json.recovery.trust.status, 'UNMANAGED')
+    assert.equal(result.json.recovery.vaultSelection.currentSessionDeclarationRecorded, true)
     assert.equal(result.json.capture.degraded, true)
     assert.match(result.json.capture.warning, /No installed lifecycle Hook/i)
   })

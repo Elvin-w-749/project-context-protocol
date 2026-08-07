@@ -1,5 +1,4 @@
 import { copyFileSync, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { discoverRepository, git, gitBlobFromIndex, gitIsolated, normalizeRemote } from './git.mjs'
@@ -74,15 +73,42 @@ function validatedLeaseSeconds(args) {
   return value
 }
 
-function defaultVault() {
-  if (process.platform === 'win32' && existsSync('H:\\')) return 'H:\\ProjectContextVault'
-  return path.join(os.homedir(), 'ProjectContextVault')
+function explicitVault(args) {
+  const value = args.vault
+  assert(
+    value !== undefined && value !== true && String(value).trim() !== '',
+    '--vault is required. Ask the user where this session may store or read the local Vault; never infer a drive or directory.',
+    'VAULT_LOCATION_REQUIRED'
+  )
+  const selected = String(value).trim()
+  assert(path.isAbsolute(selected), '--vault must be the absolute path explicitly selected by the current user', 'VAULT_LOCATION_ABSOLUTE_REQUIRED')
+  return selected
+}
+
+function requireUserConfirmedVault(args, operation) {
+  explicitVault(args)
+  assert(
+    args['vault-confirmed-by-user'] === true,
+    `${operation} requires --vault-confirmed-by-user after the current user explicitly selects the Vault path for this session`,
+    'VAULT_LOCATION_CONFIRMATION_REQUIRED'
+  )
+}
+
+function vaultSelectionRecord(vault, operation) {
+  return {
+    path: path.resolve(vault),
+    currentUserSelectionDeclared: true,
+    declarationScope: 'current-session-explicit-path',
+    operation,
+    declarationRecordedAt: nowIso(),
+    historicalOnly: true
+  }
 }
 
 function inputs(args) {
   return {
     repo: path.resolve(args.repo && args.repo !== true ? String(args.repo) : process.cwd()),
-    vault: path.resolve(args.vault && args.vault !== true ? String(args.vault) : defaultVault())
+    vault: path.resolve(explicitVault(args))
   }
 }
 
@@ -177,7 +203,8 @@ function safeStateSummary(bundle) {
       dirty: bundle.state.observation.dirty,
       statusFingerprint: bundle.state.observation.statusFingerprint
     },
-    task: boundedTask(bundle.state.task)
+    task: boundedTask(bundle.state.task),
+    vaultSelection: bundle.state.vaultSelection || null
   })
 }
 
@@ -725,12 +752,20 @@ function boundedRecords(records, count = 8) {
   })
 }
 
-function recoveryCard(bundle, observation, paths) {
+function recoveryCard(bundle, observation, paths, currentSelection) {
   const trust = classifyTrust(bundle, observation, paths)
+  const vaultSelection = {
+    path: paths.vault,
+    currentSessionDeclarationRecorded: currentSelection?.currentUserSelectionDeclared === true,
+    declarationScope: currentSelection?.declarationScope || null,
+    declarationRecordedAt: currentSelection?.declarationRecordedAt || null
+  }
   if (!bundle) {
     return {
       trust,
       repository: { root: observation.root, branch: observation.branch, head: observation.head, dirty: observation.dirty },
+      vaultSelection,
+      lastRecordedVaultSelection: null,
       task: null,
       requirement: null,
       progress: [],
@@ -754,6 +789,8 @@ function recoveryCard(bundle, observation, paths) {
   })
   return safeProjection({
     trust,
+    vaultSelection,
+    lastRecordedVaultSelection: bundle.state.vaultSelection || null,
     repository: {
       repoId: observation.repoId,
       workspaceId: observation.workspaceId,
@@ -814,6 +851,7 @@ function textCard(card) {
   const full = `# Recovery Card
 
 Trust: ${card.trust.status}${card.trust.reasons.length ? ` — ${card.trust.reasons.join(' ')}` : ''}
+Vault: ${card.vaultSelection?.path || card.references?.vault || 'not recorded'} (${card.vaultSelection?.currentSessionDeclarationRecorded ? `current-session user-selection declaration recorded at ${card.vaultSelection.declarationRecordedAt || 'unknown time'}` : 'current-session declaration not recorded'})
 
 1. Repository / branch / HEAD
    - ${card.repository.root}
@@ -846,6 +884,7 @@ Open runs
 ${active}
 
 References
+- Vault: ${card.references.vault || card.vaultSelection?.path || 'not recorded'}
 - Machine state: ${card.references.machineState || 'not created'}
 - Project context: ${card.references.projectContext || 'not created'}
 - Architecture: ${card.references.architecture || 'not created'}
@@ -858,6 +897,7 @@ References
   if (estimatedTokens <= 1150) return full
   return `# Recovery Card (bounded)
 Trust: ${card.trust.status} — ${safeSummary(card.trust.reasons.join(' '), 180)}
+Vault: ${card.vaultSelection?.path || card.references?.vault || 'not recorded'} | current-session declaration ${card.vaultSelection?.currentSessionDeclarationRecorded ? 'recorded' : 'not recorded'}
 1. Repo: ${card.repository.root} | ${card.repository.branch || 'DETACHED'} @ ${card.repository.head} | dirty ${card.repository.dirty ? 'yes' : 'no'}
 2. Task: ${task ? `${task.id}: ${safeSummary(task.title, 120)}` : 'not recorded'}
 3. Requirement: ${safeSummary(card.requirement || task?.reason || 'Not recorded.', 180)} | PRD ${task?.prd?.sha256 || 'not recorded'} (${task?.prd?.approval || 'not recorded'})
@@ -1207,7 +1247,9 @@ function activeRunEntry(paths, run) {
 }
 
 export function registerCommand(args) {
+  requireUserConfirmedVault(args, 'register')
   const current = observe(args)
+  const vaultSelection = vaultSelectionRecord(current.paths.vault, 'register')
   const vaultInitialized = existsSync(current.paths.registry) || existsSync(current.paths.repositoryMetadata) || existsSync(current.paths.currentPointer)
   if (!vaultInitialized) {
     const preliminaryTask = taskRecord(args, null)
@@ -1248,6 +1290,7 @@ export function registerCommand(args) {
         detached: current.observation.detached
       },
       observation: compactObservation(current.observation),
+      vaultSelection,
       task,
       stage: 'registered',
       taskHistory,
@@ -1257,12 +1300,14 @@ export function registerCommand(args) {
     const manifest = generateProjectMap(current.paths, current.observation)
     state.map = mapReference(manifest, current.paths)
     bundle = writeState(current.paths, bundle, state)
-    return { command: 'register', state: safeStateSummary(bundle), pointer: bundle.pointer, map: state.map, recovery: recoveryCard(bundle, current.observation, current.paths) }
+    return { command: 'register', state: safeStateSummary(bundle), pointer: bundle.pointer, map: state.map, recovery: recoveryCard(bundle, current.observation, current.paths, vaultSelection) }
   })
 }
 
 export function beginCommand(args) {
+  requireUserConfirmedVault(args, 'begin')
   const current = observe(args)
+  const vaultSelection = vaultSelectionRecord(current.paths.vault, 'begin')
   const leaseSeconds = validatedLeaseSeconds(args)
   const vaultInitialized = existsSync(current.paths.registry) || existsSync(current.paths.repositoryMetadata) || existsSync(current.paths.currentPointer)
   if (!vaultInitialized) {
@@ -1369,6 +1414,7 @@ export function beginCommand(args) {
         leaseTtlSeconds: leaseSeconds,
         leaseSource: args.harness && args.harness !== true ? String(args.harness) : 'manual-cli',
         captureCoverage: args.coverage && args.coverage !== true ? String(args.coverage) : 'observed-and-agent-reported',
+        vaultSelection,
         request: args.request && args.request !== true ? String(args.request) : task.objective,
         authority: args.authority && args.authority !== true ? String(args.authority) : null,
         authoritySource: args['authority-source'] && args['authority-source'] !== true ? String(args['authority-source']) : 'current-user-request'
@@ -1515,6 +1561,7 @@ export function beginCommand(args) {
         }] : bundle.state.abandonedRuns || [],
         repo: { ...bundle.state.repo, branch: current.observation.branch, detached: current.observation.detached },
         observation: created.run.startObservation,
+        vaultSelection: created.run.vaultSelection,
         trust: unresolvedBlockers ? { status: 'BLOCKED', reasons: ['One or more recorded blockers remain open.'] } : preservePriorTrust ? bundle.state.trust : { status: 'READY', reasons: [] },
         activeRuns: [...bundle.state.activeRuns.filter((item) => item.runId !== runId && item.runId !== recoveredFromRunId), activeRunEntry(current.paths, created.run)],
         authorityHistory: created.run.authorityRecord ? [...bundle.state.authorityHistory, {
@@ -1548,16 +1595,19 @@ export function beginCommand(args) {
       stateBindingHash: routeToken(bundle, current.observation, runId),
       routeRequired: true,
       stateGeneration: bundle.state.generation,
-      historicalAuthorizationOnly: true
+      historicalAuthorizationOnly: true,
+      vaultSelection: bundle.state.vaultSelection
     }
   })
 }
 
 export function resumeCommand(args) {
+  requireUserConfirmedVault(args, 'resume')
   const current = observe(args)
+  const vaultSelection = vaultSelectionRecord(current.paths.vault, 'resume')
   validateVaultLocation(current.vault, current.observation)
   const bundle = loadState(current.paths)
-  const card = recoveryCard(bundle, current.observation, current.paths)
+  const card = recoveryCard(bundle, current.observation, current.paths, vaultSelection)
   return { command: 'resume', card, text: textCard(card), exitCode: ['READY', 'UNMANAGED'].includes(card.trust.status) ? 0 : 3 }
 }
 
@@ -2433,6 +2483,7 @@ function verifyAllRunRecords(paths) {
 }
 
 export function verifyCommand(args) {
+  requireUserConfirmedVault(args, 'verify')
   const current = observe(args)
   if (args['repair-views']) {
     return withStateLock(current.paths, () => {
@@ -2542,6 +2593,7 @@ export function verifyCommand(args) {
 }
 
 export function doctorCommand(args) {
+  requireUserConfirmedVault(args, 'doctor')
   const current = observe(args)
   let verification = null
   try {
@@ -2591,6 +2643,7 @@ const helpText = (command, purpose, requiredOptions, optionalOptions, exits) => 
 
 export const COMMAND_HELP = {
   register: helpText('register', 'create first state, or refresh an existing state under its active session', [
+    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.',
     '--task <title>  Required for a managed first registration.',
     '--prd-path <file> --prd-approval <approved|user-approved|accepted>  Required when recording a PRD.'
   ], [
@@ -2599,7 +2652,9 @@ export const COMMAND_HELP = {
     '--transition-reason or --task-update-reason  Mandatory for the corresponding task revision.',
     'PRD revision reconciliation is deliberately refused here; use begin.'
   ], ['0 success.', '1 validation, identity, session, trust, or filesystem failure.']),
-  begin: helpText('begin', 'create a new authenticated Agent run and return its bearer session token once', [], [
+  begin: helpText('begin', 'create a new authenticated Agent run and return its bearer session token once', [
+    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.'
+  ], [
     '--task and task contract fields  Required if no task is registered.',
     '--recover <run> --recovery-reason <text> --authority <text> --current-session-authority  Supersede an active run without rewriting it.',
     '--recovered-session <token>  Optional proof of the old run token; never authorizes rewriting the old immutable run.',
@@ -2610,7 +2665,9 @@ export const COMMAND_HELP = {
     '--lease-seconds <5..86400>  Run ownership lease; use adapter heartbeat to renew.',
     '--agent/--harness/--request/--next  Run metadata.'
   ], ['0 success; securely retain returned session token.', '1 any missing ownership, reconciliation, PRD, identity, or storage requirement.']),
-  resume: helpText('resume', 'print a bounded Recovery Card without mutating state', [], ['--json  Emit the complete bounded card as JSON.'], ['0 READY or initially UNMANAGED.', '3 STALE, CONFLICT, or BLOCKED.']),
+  resume: helpText('resume', 'print a bounded Recovery Card without mutating state', [
+    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.'
+  ], ['--json  Emit the complete bounded card as JSON.'], ['0 READY or initially UNMANAGED.', '3 STALE, CONFLICT, or BLOCKED.']),
   route: helpText('route', 'select or validate one deterministic route bound to live state', [
     '--event <comma-separated-signals>  Required; validation recomputes the mode from these signals.'
   ], [
@@ -2648,13 +2705,17 @@ export const COMMAND_HELP = {
   import: helpText('import', 'reserved local archive import (disabled in standalone v1)', [
     '--run <id> --session <token> --source <export-directory> --route-token <token> --authority <text> --current-session-authority --acknowledge-untrusted-import'
   ], ['High-risk routes are non-executable in standalone v1.'], ['1 standalone authorization boundary, route, identity, manifest, or integrity failure; no import is adopted.']),
-  verify: helpText('verify', 'validate generations, events, maps, derived views, live trust, and readiness', [], [
+  verify: helpText('verify', 'validate generations, events, maps, derived views, live trust, and readiness', [
+    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.'
+  ], [
     '--repair-views --run <id> --session <token>  Rebuild derived vault views; repair is a write and requires a current session.'
   ], ['0 integrity valid and trust READY.', '2 integrity failure or trust not READY.', '1 identity/state/argument failure.']),
   finish: helpText('finish', 'close the authenticated run with a bounded handoff', [
     '--run <id> --session <token> --status <completed|partial|blocked> --summary <text>'
   ], ['--details <text> --next <text>  Handoff context. Live repository drift must be checkpointed first.'], ['0 run closed and state updated.', '1 session, drift, trust, or state failure.']),
-  doctor: helpText('doctor', 'report protocol integrity, capture limitations, and local privacy posture', [], ['The suite never uploads vault data; only an explicitly opted-in push observer may run read-only git ls-remote.'], ['0 report produced.', '1 repository/vault discovery failure.'])
+  doctor: helpText('doctor', 'report protocol integrity, capture limitations, and local privacy posture', [
+    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.'
+  ], ['The suite never uploads vault data; only an explicitly opted-in push observer may run read-only git ls-remote.'], ['0 report produced.', '1 repository/vault discovery failure.'])
 }
 
 export const HELP = `contextctl — local project context and run protocol
@@ -2678,16 +2739,18 @@ Commands:
 
 Common options:
   --repo <path>       Target Git worktree (default: current directory).
-  --vault <path>      Local vault outside every Git repository.
+  --vault <path>      Required explicit user-selected local vault outside every Git repository; there is no default.
+  --vault-confirmed-by-user  Required by resume/register/begin/verify/doctor after the current user selects the exact path; records a declaration, not cryptographic identity proof.
   --json              Emit JSON where a command also has a text view.
 
 Examples:
-  contextctl register --repo H:\\Project --vault H:\\ProjectContextVault --task "Fix upload" --requirement "Confirmed PRD section"
-  contextctl begin --repo H:\\Project --vault H:\\ProjectContextVault --request "Current user request" --agent codex
-  contextctl route --repo H:\\Project --vault H:\\ProjectContextVault --run RUN-... --session SESSION-... --event diagnose
-  contextctl checkpoint --repo H:\\Project --vault H:\\ProjectContextVault --run RUN-... --session SESSION-... --event observation --summary "Observed failure" --fact "HTTP 413 only occurs at the proxy" --evidence EVID-...
-  contextctl verify --repo H:\\Project --vault H:\\ProjectContextVault
-  contextctl finish --repo H:\\Project --vault H:\\ProjectContextVault --run RUN-... --session SESSION-... --status partial --summary "Implementation complete; deployment not attempted" --next "Run mobile acceptance test"
+  contextctl register --repo H:\\Project --vault <user-selected-absolute-path> --vault-confirmed-by-user --task "Fix upload" --requirement "Confirmed PRD section"
+  contextctl resume --repo H:\\Project --vault <user-selected-absolute-path> --vault-confirmed-by-user
+  contextctl begin --repo H:\\Project --vault <user-selected-absolute-path> --vault-confirmed-by-user --request "Current user request" --agent codex
+  contextctl route --repo H:\\Project --vault <user-selected-absolute-path> --run RUN-... --session SESSION-... --event diagnose
+  contextctl checkpoint --repo H:\\Project --vault <user-selected-absolute-path> --run RUN-... --session SESSION-... --event observation --summary "Observed failure" --fact "HTTP 413 only occurs at the proxy" --evidence EVID-...
+  contextctl verify --repo H:\\Project --vault <user-selected-absolute-path> --vault-confirmed-by-user
+  contextctl finish --repo H:\\Project --vault <user-selected-absolute-path> --run RUN-... --session SESSION-... --status partial --summary "Implementation complete; deployment not attempted" --next "Run mobile acceptance test"
 
 Trust rules:
   Machine JSON is authoritative; Markdown is derived. Archived authorization is historical only.

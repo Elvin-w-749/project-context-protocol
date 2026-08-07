@@ -30,6 +30,8 @@ initializing -> active -> completed | partial | blocked | interrupted | failed-t
 
 `active` is the machine value for the PRD's human term “open”. It does not imply that a process ID is still alive.
 
+A run cannot enter `initializing` until the current user has explicitly selected one absolute Vault path for this session. Record the normalized path, declaration scope, operation, and declaration-recording time in the run and its immutable `session-start` event. This is provenance of what the caller declared when the command ran, not proof of when the user answered or who the user was, and it becomes historical after that run boundary. An archived selection cannot be reused as current-session confirmation.
+
 Each new active run has a bounded lease containing a last heartbeat and expiry. `begin` creates it; an authenticated checkpoint renews it while it remains valid. `resume` and routing classify a missing, malformed, or expired active lease as a disconnected-run conflict. Expiry is observation only: it never changes the run to completed, never proves the prior process died, and never lets an old process silently revive the run. Recovery creates a new explicitly related run under the existing authority rules.
 
 Create the run in `initializing` before project adoption. `begin` returns a bearer session token once while the run stores only its hash; every state-writing run command must present that token. A new session cannot adopt an old active run without its token. It creates a new explicitly recovered, parented, or parallel run instead, and never rewrites the old run as if it had remained alive.
@@ -84,6 +86,6 @@ Hashes, generations, and compare-and-swap provide internal consistency, not auth
 
 ## Recovery Card and route credential
 
-The bounded Recovery Card answers repository/branch/HEAD, unique task, confirmed requirement/PRD, scoped progress evidence, blockers, and the next allowed/prohibited boundary. It cites machine state, architecture, file index, current/last run, and capture limits; it does not load every historical run.
+The bounded Recovery Card answers repository/branch/HEAD, the explicitly supplied Vault path and current-session declaration status, unique task, confirmed requirement/PRD, scoped progress evidence, blockers, and the next allowed/prohibited boundary. It may cite the last persisted Vault-selection record only as historical provenance. It also cites machine state, architecture, file index, current/last run, and capture limits; it does not load every historical run.
 
 The HMAC-authenticated route credential binds key ID, `repo_id`, `workspace_id`, `context_id`, branch, HEAD/tree, dirty-content fingerprint, `task_id` and PRD hash, state generation/hash, active `run_id` and session hash, normalized signals, one recomputed mode, authority fingerprint/status, issue time, and expiry. It detects tampering and staleness relative to the local key; it does not prove user authority. High-risk routes are non-executable in standalone version 1.

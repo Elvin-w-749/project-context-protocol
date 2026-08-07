@@ -6,6 +6,12 @@ This repository is a focused redesign inspired by the MIT-licensed `superpowers`
 
 The full local vault is stored outside the target Git worktree and is never uploaded by the suite. The only optional network-capable operation is an explicitly requested, credential-free, read-only `git ls-remote` observation used to verify one exact pushed ref over allowlisted HTTPS or Git transport; a local-file remote needs no network. SSH, HTTP, UNC/network shares, remote-host `file://`, embedded credentials, and custom helpers are rejected. All other network or model activity belongs to the surrounding Agent/Harness. This does not imply that an Agent or remote model reading vault content keeps that content on the machine.
 
+The suite has no default Vault location. Before every new Agent session, the Agent or trusted Harness must ask the current user for the absolute local path to open or store the Vault. A path found in old state, a previous conversation, an environment variable, a familiar drive, or an existing directory is not current-session confirmation. The CLI is intentionally non-interactive: it fails closed when the caller has not supplied the selected path and the required session-start declaration.
+
+## 使用指南
+
+- [项目上下文控制协议 Skills 使用指南（PDF）](docs/项目上下文控制协议_Skills使用指南.pdf)
+
 ## Skills
 
 - `project-context-protocol`: trusted recovery, routing, run lifecycle, architecture and file maps.
@@ -28,29 +34,32 @@ context-adapter --help
 
 `npm link` exposes the two local commands without installing a Hook or changing a target repository. An Agent/Harness integration must call `context-adapter` explicitly; otherwise capture is correctly reported as degraded.
 
-To upgrade, preserve the external vault, pull a reviewed suite revision, run `npm run verify`, run `npm link` again, and then run `contextctl doctor` against each managed project. Do not migrate a non-empty pre-protocol vault by inventing an ACL marker: move it aside under explicit user control or implement and review a migration. Protocol generations remain immutable.
+To upgrade, preserve the external vault, pull a reviewed suite revision, run `npm run verify`, run `npm link` again, ask the current user to select the Vault path, and then run `contextctl doctor --repo <path> --vault <selected-absolute-path> --vault-confirmed-by-user` against each managed project. Do not migrate a non-empty pre-protocol vault by inventing an ACL marker: move it aside under explicit user control or implement and review a migration. Protocol generations remain immutable.
 
-To uninstall the commands, run `npm unlink -g project-context-protocol` (or `npm uninstall -g project-context-protocol` if installed globally). Uninstalling never deletes `H:\ProjectContextVault`; archive or delete that local sensitive data only with explicit user authorization.
+To uninstall the commands, run `npm unlink -g project-context-protocol` (or `npm uninstall -g project-context-protocol` if installed globally). Uninstalling never deletes any user-selected Vault; archive or delete that local sensitive data only with explicit user authorization.
 
 ## CLI
 
 ```powershell
-node skills/project-context-protocol/scripts/contextctl.mjs register --repo H:\Project --vault H:\ProjectContextVault
-node skills/project-context-protocol/scripts/contextctl.mjs begin --repo H:\Project --vault H:\ProjectContextVault --task "Current task" --request "User request"
-node skills/project-context-protocol/scripts/contextctl.mjs resume --repo H:\Project --vault H:\ProjectContextVault
-node skills/project-context-protocol/scripts/contextctl.mjs route --repo H:\Project --vault H:\ProjectContextVault --run RUN-... --event error
+$Vault = Read-Host 'Absolute local Vault path selected for this Agent session'
+node skills/project-context-protocol/scripts/contextctl.mjs resume --repo H:\Project --vault $Vault --vault-confirmed-by-user
+# Only when the Recovery Card says UNMANAGED:
+node skills/project-context-protocol/scripts/contextctl.mjs register --repo H:\Project --vault $Vault --vault-confirmed-by-user --task "Current task"
+node skills/project-context-protocol/scripts/contextctl.mjs begin --repo H:\Project --vault $Vault --vault-confirmed-by-user --request "User request"
+node skills/project-context-protocol/scripts/contextctl.mjs route --repo H:\Project --vault $Vault --run RUN-... --session SESSION-... --event error
 ```
 
 Run `contextctl --help` for the command inventory and `contextctl <command> --help` for that command's required arguments, safety gates, and exit behavior. If an option is uncertain, stop and resolve the contract instead of inventing a flag. Run `npm run verify` before installation or publication.
 
-Each new Agent session follows `resume → register if needed → begin → route`. `begin` is required even for an already registered project. A recovered session creates a new run with `--recover`; it never rewrites the interrupted run.
+Each new Agent session follows `ask for the absolute Vault path and wait → resume → register if needed → begin → route`. `begin` is required even for an already registered project. A recovered session creates a new run with `--recover`; it never rewrites the interrupted run.
 
 For a single lifecycle entry point, use the bundled adapter:
 
 ```powershell
-context-adapter session-start --repo H:\Project --vault H:\ProjectContextVault --task "Current task"
-context-adapter heartbeat --repo H:\Project --vault H:\ProjectContextVault --run RUN-... --session SESSION-...
-context-adapter session-stop --repo H:\Project --vault H:\ProjectContextVault --run RUN-... --session SESSION-...
+$Vault = Read-Host 'Absolute local Vault path selected for this Agent session'
+context-adapter session-start --repo H:\Project --vault $Vault --vault-confirmed-by-user --task "Current task"
+context-adapter heartbeat --repo H:\Project --vault $Vault --run RUN-... --session SESSION-...
+context-adapter session-stop --repo H:\Project --vault $Vault --run RUN-... --session SESSION-...
 ```
 
 `session-start` performs recovery, optional first registration, run creation, deterministic routing, and returns the bounded Recovery Card. `heartbeat` is an authenticated checkpoint that renews the active-run lease. `session-stop` records a handoff and defaults to `partial`; it never infers completion. The standalone adapter never launches child programs, because an arbitrary child could bypass routing and perform a high-risk action. Without a genuinely installed lifecycle Hook, every adapter result is explicitly marked `degraded-no-installed-hook`; it cannot observe bypassed tools or hidden Agents.
@@ -66,7 +75,7 @@ High-risk routes are deliberately non-executable in standalone version 1. `--aut
 ## Safety boundaries
 
 - Vault records are local files and are not automatically committed or synchronized.
-- The default vault is plaintext. Review OS permissions and prefer an encrypted volume before storing real credentials or customer data.
+- After the user selects a Vault location, version 1 stores its records as local plaintext. Review OS permissions and prefer an encrypted volume before storing real credentials or customer data.
 - The CLI never uploads vault data. An explicitly opted-in, credential-free push observation may query one exact HTTPS/Git remote ref with `git ls-remote`; local-file remotes stay local, and SSH/HTTP/UNC/custom transports are rejected. A remote Agent/model can separately transmit any vault content it reads.
 - A historical or Agent-reported authorization record never authorizes a new commit, push, deployment, rollback, deletion, export, or secret disclosure.
 - Every new run has a bounded heartbeat lease. An expired, missing, or malformed active-run lease is a disconnected-run conflict; it is never promoted to completed and cannot be silently revived by an old process.
