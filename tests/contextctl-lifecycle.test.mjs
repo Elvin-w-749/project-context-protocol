@@ -193,7 +193,7 @@ test('state map snapshot fields must each match the integrity-checked versioned 
   })
 })
 
-test('high-risk routing fails closed without an external provider while low-risk credentials still detect staleness', () => {
+test('high-risk routing separates credential validity, recording readiness, and protocol execution', () => {
   withFixture(({ repo, vault }) => {
     register(repo, vault)
     const run = begin(repo, vault)
@@ -206,14 +206,33 @@ test('high-risk routing fails closed without an external provider while low-risk
     assert.equal(unauthorized.status, 5)
     assert.equal(unauthorized.json.mode, 'release-with-provenance')
     assert.equal(unauthorized.json.executable, false)
-    assert.equal(unauthorized.json.authority.status, 'standalone-high-risk-execution-disabled')
+    assert.equal(unauthorized.json.recordingReady, false)
+    assert.equal(unauthorized.json.authority.status, 'current-session-authority-required')
+    assert.ok(unauthorized.json.readinessBlockers.includes('currentAuthority'))
 
     const before = protocolMutationSnapshot(vault)
     const authorityOnly = releaseRoute(repo, vault, run, authority)
     assert.equal(authorityOnly.executable, false)
-    assert.equal(authorityOnly.authority.status, 'standalone-high-risk-execution-disabled')
-    assert.equal(authorityOnly.externalApproval.valid, false)
-    assert.match(authorityOnly.externalApproval.reason, /STANDALONE_HIGH_RISK_EXECUTION_DISABLED/)
+    assert.equal(authorityOnly.recordingReady, true)
+    assert.equal(authorityOnly.authority.status, 'current-session-authority-bound-host-action-external')
+    assert.equal(authorityOnly.externalApproval.evaluatedByProtocol, false)
+    assert.equal(authorityOnly.externalApproval.authority, 'external-to-protocol')
+    const authorityValidation = cli('route', {
+      args: {
+        repo,
+        vault,
+        run: run.runId,
+        session: run.session,
+        event: 'push',
+        validate: authorityOnly.credential,
+        authority,
+        'current-session-authority': true
+      }
+    }).json
+    assert.equal(authorityValidation.valid, true)
+    assert.equal(authorityValidation.recordingReady, true)
+    assert.equal(authorityValidation.executable, false)
+    assert.deepEqual(authorityValidation.mismatches, [])
     assert.deepEqual(protocolMutationSnapshot(vault), before)
 
     const lowRisk = cli('route', {
@@ -253,7 +272,7 @@ test('high-risk routing fails closed without an external provider while low-risk
   })
 })
 
-test('export and import remain fail-closed when no external approval provider is configured', () => {
+test('export and import remain disabled even when a credential is valid and recording-ready', () => {
   withFixture(({ root, repo, vault }) => {
     register(repo, vault)
     const run = begin(repo, vault)
@@ -261,7 +280,7 @@ test('export and import remain fail-closed when no external approval provider is
     const release = releaseRoute(repo, vault, run, authority, 'export')
     const destination = path.join(root, 'authorized-export')
     assert.equal(release.executable, false)
-    assert.match(release.externalApproval.reason, /STANDALONE_HIGH_RISK_EXECUTION_DISABLED/)
+    assert.equal(release.recordingReady, true)
 
     const before = protocolMutationSnapshot(vault)
     const deniedExport = cli('export', {
@@ -281,18 +300,19 @@ test('export and import remain fail-closed when no external approval provider is
       allowFailure: true
     })
     assert.notEqual(deniedExport.status, 0)
-    assert.equal(failureCode(deniedExport), 'ROUTE_CREDENTIAL_INVALID')
+    assert.equal(failureCode(deniedExport), 'PROTOCOL_EXECUTION_DISABLED')
     assert.equal(existsSync(destination), false)
     const importRoute = releaseRoute(repo, vault, run, authority, 'import')
     assert.equal(importRoute.executable, false)
-    assert.match(importRoute.externalApproval.reason, /STANDALONE_HIGH_RISK_EXECUTION_DISABLED/)
+    assert.equal(importRoute.recordingReady, true)
     assert.deepEqual(protocolMutationSnapshot(vault), before)
   })
 })
 
 test('lock readers tolerate an in-progress exclusive owner write but preserve a persistently corrupt lock', async () => {
   await withFixture(async ({ root }) => {
-    const locks = path.join(root, 'lock-protocol-fixture')
+    const vault = root
+    const locks = path.join(vault, 'lock-protocol-fixture')
     mkdirSync(locks, { recursive: true })
     const lockFile = path.join(locks, 'state.lock')
     const childScript = String.raw`
@@ -340,7 +360,7 @@ process.stdin.once('data', () => {
     child.stdin.end('publish-owner\n')
     let contentionError = null
     try {
-      withStateLock({ locks }, () => {})
+      withStateLock({ vault, locks }, () => {})
     } catch (error) {
       contentionError = error
     }
@@ -350,7 +370,7 @@ process.stdin.once('data', () => {
     writeFileSync(lockFile, '{persistently malformed lock\n', 'utf8')
     const corruptBytes = readFileSync(lockFile)
     assert.throws(
-      () => withStateLock({ locks }, () => {}),
+      () => withStateLock({ vault, locks }, () => {}),
       (error) => error?.code === 'STATE_LOCK_CORRUPT'
     )
     assert.deepEqual(readFileSync(lockFile), corruptBytes)
@@ -364,7 +384,7 @@ process.stdin.once('data', () => {
     })}\n`
     writeFileSync(lockFile, staleOwner, 'utf8')
     assert.throws(
-      () => withStateLock({ locks }, () => {}),
+      () => withStateLock({ vault, locks }, () => {}),
       (error) => error?.code === 'STATE_LOCKED' && /explicit out-of-band recovery/i.test(error.message)
     )
     assert.equal(readFileSync(lockFile, 'utf8'), staleOwner)
@@ -1020,7 +1040,7 @@ test('model-access remains fail-closed even when authority flags and a route HMA
       allowFailure: true
     })
     assert.notEqual(rejected.status, 0)
-    assert.equal(failureCode(rejected), 'ROUTE_CREDENTIAL_INVALID')
+    assert.equal(failureCode(rejected), 'PROTOCOL_EXECUTION_DISABLED')
     assert.equal(findFiles(vault, (_absolute, name) => name === 'evidence.json').length, evidenceBefore)
     assert.deepEqual(protocolMutationSnapshot(vault), before)
   })
@@ -1467,7 +1487,7 @@ test('weak or non-performed lifecycle evidence cannot support a deployed claim',
           allowFailure: true
         })
         assert.notEqual(rejected.status, 0)
-        assert.equal(failureCode(rejected), 'ROUTE_TOKEN_STALE')
+        assert.equal(failureCode(rejected), 'SUPPORTED_RELEASE_OBSERVER_UNAVAILABLE')
         assert.deepEqual(protocolMutationSnapshot(vault), before)
       }
     })
@@ -1595,7 +1615,7 @@ test('manual kind labels and an arbitrary command cannot forge a successful perf
       allowFailure: true
     })
     assert.notEqual(forged.status, 0)
-    assert.equal(failureCode(forged), 'ROUTE_TOKEN_STALE')
+    assert.equal(failureCode(forged), 'STANDALONE_HIGH_RISK_EXECUTION_DISABLED')
     assert.deepEqual(protocolMutationSnapshot(vault), before)
 
     const unsupported = cli('checkpoint', {
@@ -1620,13 +1640,13 @@ test('manual kind labels and an arbitrary command cannot forge a successful perf
       allowFailure: true
     })
     assert.notEqual(unsupported.status, 0)
-    assert.equal(failureCode(unsupported), 'ROUTE_TOKEN_STALE')
+    assert.equal(failureCode(unsupported), 'SUPPORTED_RELEASE_OBSERVER_UNAVAILABLE')
     assert.deepEqual(protocolMutationSnapshot(vault), before)
     assert.equal(authoritativeState(vault).claims.some((claim) => claim.type === 'deployed' && claim.status === 'supported'), false)
   })
 })
 
-test('standalone high-risk routes fail closed without starting commit, push, deploy, rollback, delete, or acceptance', () => {
+test('standalone high-risk routes become recording-ready without starting commit, push, deploy, rollback, delete, or acceptance', () => {
   withFixture(({ root, repo, vault }) => {
     const remote = path.join(root, 'origin.git')
     run('git', ['init', '--bare', remote])
@@ -1674,10 +1694,11 @@ test('standalone high-risk routes fail closed without starting commit, push, dep
         },
         allowFailure: true
       })
-      assert.notEqual(routed.status, 0)
+      assert.equal(routed.status, 0)
       assert.equal(routed.json?.executable, false)
-      assert.equal(routed.json?.externalApproval?.valid, false)
-      assert.match(routed.json?.externalApproval?.reason || '', /STANDALONE_HIGH_RISK_EXECUTION_DISABLED/)
+      assert.equal(routed.json?.recordingReady, true)
+      assert.equal(routed.json?.externalApproval?.evaluatedByProtocol, false)
+      assert.equal(routed.json?.executionAuthority, 'external-to-protocol')
     }
     assert.equal(existsSync(marker), false)
     assert.equal(git(repo, 'rev-parse', 'HEAD'), beforeHead)
@@ -1687,7 +1708,7 @@ test('standalone high-risk routes fail closed without starting commit, push, dep
   })
 })
 
-test('agent-supplied approval public keys and forged capabilities cannot enable a high-risk route', () => {
+test('agent-supplied approval material cannot make the protocol execute a high-risk host action', () => {
   withFixture(({ root, repo, vault }) => {
     const fakePublicKey = path.join(root, 'agent-supplied-approval.pem')
     writeFileSync(fakePublicKey, '-----BEGIN PUBLIC KEY-----\nZm9yZ2Vk\n-----END PUBLIC KEY-----\n', 'utf8')
@@ -1721,9 +1742,10 @@ test('agent-supplied approval public keys and forged capabilities cannot enable 
       },
       allowFailure: true
     })
-    assert.notEqual(routed.status, 0)
+    assert.equal(routed.status, 0)
     assert.equal(routed.json?.executable, false)
-    assert.match(routed.json?.externalApproval?.reason || '', /STANDALONE_HIGH_RISK_EXECUTION_DISABLED/)
+    assert.equal(routed.json?.recordingReady, true)
+    assert.equal(routed.json?.externalApproval?.evaluatedByProtocol, false)
     assert.deepEqual(protocolMutationSnapshot(vault), before)
   })
 })
@@ -1901,6 +1923,7 @@ test('resume blocks when trusted architecture or nested event evidence is tamper
       writeFileSync(captured.evidence.storedPath, 'tampered nested evidence\n', 'utf8')
       const resumed = cli('resume', { args: { repo, vault, json: true }, allowFailure: true })
       assert.notEqual(resumed.status, 0)
+      assert.ok(resumed.json?.card, JSON.stringify(resumed))
       assert.equal(resumed.json.card.trust.status, 'BLOCKED')
       assert.match(resumed.json.card.trust.reasons.join(' '), /supported verified claim.*(missing|corrupt|binding)/i)
     })
@@ -1927,6 +1950,8 @@ test('commit and push routes fail Git preflight for staged local-vault material'
       assert.notEqual(routed.status, 0)
       assert.equal(routed.json.sensitiveGitPreflight.passed, false)
       assert.equal(routed.json.executable, false)
+      assert.equal(routed.json.recordingReady, false)
+      assert.ok(routed.json.readinessBlockers.includes('sensitiveGitPreflight'))
       assert.ok(routed.json.sensitiveGitPreflight.violations.some((entry) => entry.includes(expectedPath)), `${event} must identify ${expectedPath}`)
     }
   }
@@ -1999,7 +2024,7 @@ test('commit and push routes fail Git preflight for staged local-vault material'
   })
 })
 
-test('ordinary staged source passes sensitive Git preflight but standalone Git routes remain non-executable', () => {
+test('ordinary staged source passes sensitive Git preflight and high-risk routes are recording-ready but non-executable', () => {
   withFixture(({ repo, vault }) => {
     register(repo, vault)
     const run = begin(repo, vault)
@@ -2036,7 +2061,8 @@ test('ordinary staged source passes sensitive Git preflight but standalone Git r
       assert.equal(routed.sensitiveGitPreflight.passed, true)
       assert.deepEqual(routed.sensitiveGitPreflight.violations, [])
       assert.equal(routed.executable, false)
-      assert.match(routed.externalApproval.reason, /STANDALONE_HIGH_RISK_EXECUTION_DISABLED/)
+      assert.equal(routed.recordingReady, true)
+      assert.equal(routed.externalApproval.evaluatedByProtocol, false)
     }
   })
 })

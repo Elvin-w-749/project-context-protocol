@@ -1,96 +1,141 @@
-# Project Context Protocol
+# Project Context Protocol v0.2
 
-Project Context Protocol is a local-first Skill suite and deterministic CLI for recovering project state, recording each Agent run, mapping repository structure, and preserving evidence-backed handoffs without prescribing how a model must solve a problem.
+一个面向任意 Git 工程的本地优先上下文控制协议。它用一个入口 Skill，让新聊天、新模型、新分支、新工作树或新设备在有限读取内恢复当前事实，并把本次开发留成下一次可复用的状态。
 
-This repository is a focused redesign inspired by the MIT-licensed `superpowers` workflow collection. It keeps the original license attribution while replacing the broad workflow set with the four context-control responsibilities below. The source checkout used for reference is never modified by this project.
+它解决的是“如何可信地继续”，不规定“模型必须怎样解决”。诊断方法、代码方案、工具、测试策略、文件顺序和是否并行协作仍由当前模型结合风险自行决定。
 
-The full local vault is stored outside the target Git worktree and is never uploaded by the suite. The only optional network-capable operation is an explicitly requested, credential-free, read-only `git ls-remote` observation used to verify one exact pushed ref over allowlisted HTTPS or Git transport; a local-file remote needs no network. SSH, HTTP, UNC/network shares, remote-host `file://`, embedded credentials, and custom helpers are rejected. All other network or model activity belongs to the surrounding Agent/Harness. This does not imply that an Agent or remote model reading vault content keeps that content on the machine.
+## 一个入口 Skill
 
-The suite has no default Vault location. Before every new Agent session, the Agent or trusted Harness must ask the current user for the absolute local path to open or store the Vault. A path found in old state, a previous conversation, an environment variable, a familiar drive, or an existing directory is not current-session confirmation. The CLI is intentionally non-interactive: it fails closed when the caller has not supplied the selected path and the required session-start declaration.
+只需要调用：
 
-## 使用指南
+```text
+$project-context-protocol
+```
 
-- [项目上下文控制协议 Skills 使用指南（PDF）](docs/项目上下文控制协议_Skills使用指南.pdf)
+原先独立的诊断、验收和发布记录 Skill 已合并为这个 Skill 的按需参考文件，避免上下文拥挤时在多个 Skill 间漏路由或误路由。
 
-## Skills
+## 安装、升级与卸载
 
-- `project-context-protocol`: trusted recovery, routing, run lifecycle, architecture and file maps.
-- `diagnose-and-decide`: evidence-led diagnosis with freedom to choose tools and solution paths.
-- `verify-and-handoff`: scoped claim verification and recoverable handoff.
-- `release-with-provenance`: precise, independently qualified Git/deployment observations and authorization boundaries.
-
-## Install and verify
-
-The suite has no runtime package dependencies and requires Node.js 20.9 or newer, Git, and (for repository publication only) GitHub CLI.
+要求 Node.js `>=20.9.0` 和 Git。克隆后可直接用 `node` 运行；若希望使用裸命令，在仓库根目录建立本机链接：
 
 ```powershell
-git clone https://github.com/wangyixin19898-png/project-context-protocol.git H:\superpowers-context
-Set-Location H:\superpowers-context
-npm run verify
+npm install
 npm link
 contextctl --help
 context-adapter --help
 ```
 
-`npm link` exposes the two local commands without installing a Hook or changing a target repository. An Agent/Harness integration must call `context-adapter` explicitly; otherwise capture is correctly reported as degraded.
-
-To upgrade, preserve the external vault, pull a reviewed suite revision, run `npm run verify`, run `npm link` again, ask the current user to select the Vault path, and then run `contextctl doctor --repo <path> --vault <selected-absolute-path> --vault-confirmed-by-user` against each managed project. Do not migrate a non-empty pre-protocol vault by inventing an ACL marker: move it aside under explicit user control or implement and review a migration. Protocol generations remain immutable.
-
-To uninstall the commands, run `npm unlink -g project-context-protocol` (or `npm uninstall -g project-context-protocol` if installed globally). Uninstalling never deletes any user-selected Vault; archive or delete that local sensitive data only with explicit user authorization.
-
-## CLI
+`npm link` 只安装命令行入口，不会自动注册 Codex Skill。还需要把仓库内唯一 Skill 链接到该设备的 Codex `skills` 目录；把下面的示例路径替换为当前设备实际的 Codex 数据目录：
 
 ```powershell
-$Vault = Read-Host 'Absolute local Vault path selected for this Agent session'
-node skills/project-context-protocol/scripts/contextctl.mjs resume --repo H:\Project --vault $Vault --vault-confirmed-by-user
-# Only when the Recovery Card says UNMANAGED:
-node skills/project-context-protocol/scripts/contextctl.mjs register --repo H:\Project --vault $Vault --vault-confirmed-by-user --task "Current task"
-node skills/project-context-protocol/scripts/contextctl.mjs begin --repo H:\Project --vault $Vault --vault-confirmed-by-user --request "User request"
-node skills/project-context-protocol/scripts/contextctl.mjs route --repo H:\Project --vault $Vault --run RUN-... --session SESSION-... --event error
+$contextSkillSource = (Resolve-Path '.\skills\project-context-protocol').Path
+$codexSkillsDirectory = 'H:\Codex\data\skills'
+$contextSkillTarget = Join-Path $codexSkillsDirectory 'project-context-protocol'
+New-Item -ItemType Junction -Path $contextSkillTarget -Target $contextSkillSource
+Test-Path (Join-Path $contextSkillTarget 'SKILL.md')
 ```
 
-Run `contextctl --help` for the command inventory and `contextctl <command> --help` for that command's required arguments, safety gates, and exit behavior. If an option is uncertain, stop and resolve the contract instead of inventing a flag. Run `npm run verify` before installation or publication.
+最后一个命令必须返回 `True`。重新启动 Codex 或开启一个新任务，确认可用 Skill 列表中出现 `project-context-protocol`。若目标已经存在，先核对它是否已经指向本仓库；不要在未确认目标的情况下覆盖或删除。新设备重复 CLI 与 Skill 两部分安装。升级使用 `git pull --ff-only` 后重新执行 `npm install`、`npm link` 和 `npm run verify`；Junction 会继续指向更新后的仓库。卸载裸命令使用 `npm unlink --global project-context-protocol`；这不会删除用户选择的上下文目录，也不会自动删除 Codex Skill 链接。
 
-Each new Agent session follows `ask for the absolute Vault path and wait → resume → register if needed → begin → route`. `begin` is required even for an already registered project. A recovered session creates a new run with `--recover`; it never rewrites the interrupted run.
+## 每次会话先确认两个值
 
-For a single lifecycle entry point, use the bundled adapter:
+在读取任何历史状态前，Agent 必须询问当前用户：
+
+1. 本次使用的绝对存储路径；
+2. 记录布局：`vault`、`markdown` 或 `hybrid`。
+
+三种布局都保留完整机器权威（代际、运行、事件和证据）。区别在于人类阅读入口，而不是删减机器记录；并发控制、哈希链、身份绑定和过期检测无法只靠自由文本可靠实现。
+
+| 布局 | 主要用途 | 人类可读记录 | 机器权威 | 跨设备特点 |
+|---|---|---|---|---|
+| `vault` | 本机严格审计 | 派生 Markdown | 完整 JSON 代际与事件链 | 同步整个选定目录 |
+| `markdown` | 优先让人和模型快速阅读 | 独立 `records/` 记录包 | 完整 JSON 代际、事件与证据链 | 同步整个选定目录；先读 `records/`，再核验机器权威 |
+| `hybrid` | 严格状态与便携交接并存 | `portable/` 脱敏边界镜像 | 完整 JSON 代际、事件与证据链 | 新设备先读便携镜像，再重关联机器状态 |
+
+协议本身不上传目录，也不默认任何盘符或路径。`--vault` 仍作为兼容别名，但新用法推荐 `--store`。
+
+## 冷启动
 
 ```powershell
-$Vault = Read-Host 'Absolute local Vault path selected for this Agent session'
-context-adapter session-start --repo H:\Project --vault $Vault --vault-confirmed-by-user --task "Current task"
-context-adapter heartbeat --repo H:\Project --vault $Vault --run RUN-... --session SESSION-...
-context-adapter session-stop --repo H:\Project --vault $Vault --run RUN-... --session SESSION-...
+node skills/project-context-protocol/scripts/context-adapter.mjs session-start `
+  --repo H:\YourProject `
+  --store H:\YourSelectedContextStore `
+  --store-confirmed-by-user `
+  --record-layout hybrid `
+  --task "当前唯一任务"
 ```
 
-`session-start` performs recovery, optional first registration, run creation, deterministic routing, and returns the bounded Recovery Card. `heartbeat` is an authenticated checkpoint that renews the active-run lease. `session-stop` records a handoff and defaults to `partial`; it never infers completion. The standalone adapter never launches child programs, because an arbitrary child could bypass routing and perform a high-risk action. Without a genuinely installed lifecycle Hook, every adapter result is explicitly marked `degraded-no-installed-hook`; it cannot observe bypassed tools or hidden Agents.
+返回内容包括有预算上限的 Recovery Card、项目 ID、仓库/工作区/分支/HEAD、唯一任务、PRD 绑定、独立进度层、阻塞项、允许/禁止边界和下一步。
 
-The current CLI provides `register`, `begin`, `resume`, `route`, `checkpoint`, `map`, `evidence`, `verify`, `finish`, and `doctor`. `export` and `import` are reserved command contracts but remain fail-closed in standalone version 1; no archive is copied, uploaded, or adopted through them.
+没有可信 Harness Hook 时，适配器会明确报告捕获降级；Skill 元数据本身不能保证所有模型或工具都自动触发。
 
-## Git and release observations
+## 常用命令
 
-The standalone suite never executes `commit`, `push`, `deploy`, `rollback`, `delete`, or `acceptance`. It records those operations only after they happen outside the suite, with attribution such as `observed` or `unattributed` and with the strongest available live evidence. A local commit does not prove a push, a push does not prove deployment, and health does not prove user acceptance.
+查看全局或单命令契约：
 
-High-risk routes are deliberately non-executable in standalone version 1. `--authority` and `--current-session-authority` are historical declarations, not cryptographic proof that the current user approved an operation. Enabling automatic execution requires a separately reviewed Harness integration whose approval channel is outside the Agent-controlled process and operating-system principal. This repository does not ship or bootstrap such a provider.
+```powershell
+node skills/project-context-protocol/scripts/contextctl.mjs --help
+node skills/project-context-protocol/scripts/contextctl.mjs daily --help
+```
 
-## Safety boundaries
+恢复与开始：
 
-- Vault records are local files and are not automatically committed or synchronized.
-- After the user selects a Vault location, version 1 stores its records as local plaintext. Review OS permissions and prefer an encrypted volume before storing real credentials or customer data.
-- The CLI never uploads vault data. An explicitly opted-in, credential-free push observation may query one exact HTTPS/Git remote ref with `git ls-remote`; local-file remotes stay local, and SSH/HTTP/UNC/custom transports are rejected. A remote Agent/model can separately transmit any vault content it reads.
-- A historical or Agent-reported authorization record never authorizes a new commit, push, deployment, rollback, deletion, export, or secret disclosure.
-- Every new run has a bounded heartbeat lease. An expired, missing, or malformed active-run lease is a disconnected-run conflict; it is never promoted to completed and cannot be silently revived by an old process.
-- On Windows, a newly created vault root is fail-closed unless its ACL is protected and restricted to the current identity, SYSTEM, and Builtin Administrators. The root marker contains only status/fingerprint metadata. Non-Windows builds report ACL enforcement as degraded.
-- The adapter mediates session lifecycle only; it is not a Git or deployment executor. Out-of-band changes are detected later and recorded as observed/unattributed.
-- Every supported progress layer, including `analyzed`, is bound to the recorded revision, tree, and dirty-content fingerprint. A later source change preserves the claim as history but marks it stale before it can be reused as current project truth.
-- Fresh clones do not have another device's local vault unless the user explicitly transfers it.
-- Hashes, route credentials, and event chains detect internal inconsistency and stale bindings; they do not prove identity, user authorization, or absolute truth.
+```powershell
+contextctl resume --repo H:\YourProject --store H:\ContextStore --store-confirmed-by-user --record-layout markdown
+contextctl begin --repo H:\YourProject --store H:\ContextStore --store-confirmed-by-user --record-layout markdown --task "当前唯一任务"
+```
 
-## Repository support boundary
+读取或更新项目简介：
 
-Version 1 requires the target to be a valid Git worktree. A non-Git target is `BLOCKED` for protocol registration and trusted task adoption; it is not `READY`. An Agent may separately perform a user-authorized manual inspection as degraded/unmanaged work, but must not claim a valid Recovery Card, protocol verification, or recoverable handoff for that target.
+```powershell
+contextctl profile --repo H:\YourProject --store H:\ContextStore --store-confirmed-by-user --record-layout markdown
+contextctl profile --repo H:\YourProject --store H:\ContextStore --store-confirmed-by-user --record-layout markdown --save --run RUN-... --session SESSION-... --project-purpose "项目目的"
+```
 
-## Portability boundary
+用户按需生成当天总结（不会安装定时任务）：
 
-The generic mapper inventories manifests, top-level structure, candidate layers, relative imports, declarations, and literal route-registration candidates. It contains no project-specific architecture rules. Semantic architecture, current bottlenecks, and cross-layer impact are added only as evidence-scoped claims from bounded source inspection.
+```powershell
+contextctl daily --repo H:\YourProject --store H:\ContextStore --store-confirmed-by-user --record-layout markdown --date 2026-08-10 --timezone Asia/Shanghai
+contextctl daily --repo H:\YourProject --store H:\ContextStore --store-confirmed-by-user --record-layout markdown --date 2026-08-10 --timezone Asia/Shanghai --save --run RUN-... --session SESSION-...
+```
 
-Only `project-context-protocol` allows implicit invocation. Focused Skills are selected by deterministic `contextctl route` output. Unknown Agent platforms still require an installed lifecycle Hook, a root instruction, or manual startup; the suite never claims universal automatic triggering or ships an arbitrary-program launcher.
+第一次 `--save` 会固化当天的事件/状态快照和 `page-size`（每页 1–10 条事件）；以后读取同一日期返回这份已校验快照，不会被未来开发状态改写，也不能用另一页大小覆盖既有页。`--live` 可用另一页大小预览当前派生结果，但不写文件、不会冒充已保存快照。保存时会重新生成该快照的全部有界页面，第 2 页写为 `YYYY-MM-DD.page-2.md`。`verify` 会逐页校验，`verify --repair-views` 可从密封 JSON 恢复被误改的日报视图。
+
+新设备或新克隆读取已转移的目录后重关联：
+
+```powershell
+contextctl relink --repo H:\NewClone --store H:\TransferredContext `
+  --store-confirmed-by-user --record-layout hybrid --project-id project-... `
+  --reason "更换设备" --authority "当前用户允许重关联" --current-session-authority
+```
+
+重关联会创建新的工作区状态；旧运行不会变成新设备上的活动会话，版本相关结论在代码不一致时会标记为过期。若同一 `projectId` 有多个来源，命令会拒绝猜测，必须从 `profile`/Recovery Card 取得精确 `stateHash` 并传入 `--source-state-hash`。
+
+## 记录与证据原则
+
+- 实时 Git 是仓库、分支、HEAD、索引和工作区状态的事实来源。
+- 机器 JSON 与不可变运行事件是协议权威；Markdown 是人类视图。
+- `analyzed`、`implemented`、`verified`、`reviewed`、`committed`、`pushed`、`deployed`、`accepted` 独立记录，不能互相推断。
+- 旧授权只属于历史；提交、推送、部署、删除和披露仍由当前用户与宿主平台授权。
+- 路由凭据只证明状态绑定和新鲜度，不授予操作权限；`valid` 只回答凭据与当前事实是否一致。
+- `executable` 只表示协议进程自身是否会执行该动作；`recordingReady` 表示当前运行是否具备记录宿主动作的前置条件。高风险宿主动作可出现 `valid=true`、`recordingReady=true`、`executable=false`；真正执行仍由当前用户和宿主平台授权，协议不限制模型选择诊断或实现路径。
+- 每次运行留下事实、假设、尝试、失败路径、文件变更、证据、阻塞、踩坑、捕获缺口和唯一下一步；不保存隐藏思维链。
+
+## 验证
+
+```powershell
+npm run validate:skills
+npm test
+npm run verify
+```
+
+完整生命周期测试在 Windows 上包含大量真实 Git/子进程隔离场景，通常会运行数分钟到十几分钟。每个测试子进程默认有 120 秒上限；仅在已确认较慢环境后，可为本次测试设置 `CONTEXT_PROTOCOL_TEST_CHILD_TIMEOUT_MS`。发布前必须让 `npm run verify` 完整退出 0；超时不能算通过。
+
+## 兼容与边界
+
+- 当前实现要求 Git worktree。
+- 新 `--store` 接口每次都要求显式 `--record-layout`；旧 `--vault` / `--vault-confirmed-by-user` 参数仍可用并兼容默认 `vault`。
+- 产品版本是 `0.2.x`；机器状态 schema 是 `2`；`project-context/v1` 是为兼容已有文件保留的线协议标识，三者不是同一个版本号。
+- schema 1 会只读兼容加载，并在下一次经会话认证的状态写入后升级为 schema 2；旧状态缺少的新 Project Profile 在升级前由 `verify` 报迁移提示而不是伪造文件。
+- `docs/项目上下文控制协议_Skills使用指南.pdf` 是此前版本的视觉指南；以本 README、当前 `SKILL.md` 和可执行 `--help` 为最新契约。
+- 选定目录中的敏感信息仍可能在 Agent 被要求读取时进入模型上下文；本地保存不等于禁止披露。

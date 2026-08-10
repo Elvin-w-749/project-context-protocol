@@ -1,12 +1,25 @@
-import { existsSync, lstatSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, realpathSync, readdirSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import { discoverRepository, listRepositoryFiles } from './git.mjs'
-import { atomicCreate, atomicWrite, ensureDir, inlineMarkdown, isWithin, nowIso, quoteMarkdown, sha256, stableJson, tableMarkdown } from './util.mjs'
+import { readSecureVaultFile, secureVaultDirectory } from './storage.mjs'
+import { assert, atomicCreate, atomicWrite, inlineMarkdown, isLexicallyWithin, isWithin, nowIso, quoteMarkdown, sha256, stableJson, tableMarkdown } from './util.mjs'
 
 const SOURCE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.vue', '.py', '.go', '.rs', '.java', '.cs', '.rb', '.php'])
 const SOURCE_LIMIT = 2000
 const SOURCE_BYTES_LIMIT = 1024 * 1024
-const SCAN_BUDGET_MS = 20_000
+const SOURCE_TOTAL_BYTES_LIMIT = 64 * 1024 * 1024
+const MAP_GENERATOR_VERSION = 'project-context-map/2'
+const MAP_SETTINGS_FINGERPRINT = sha256(stableJson({
+  sourceExtensions: [...SOURCE_EXTENSIONS].sort(),
+  sourceLimit: SOURCE_LIMIT,
+  sourceBytesLimit: SOURCE_BYTES_LIMIT,
+  sourceTotalBytesLimit: SOURCE_TOTAL_BYTES_LIMIT,
+  parser: 'bounded-cross-language-regex-candidates/v2'
+}, 0))
+
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0
+}
 
 function inspectFile(root, relative, maxBytes = SOURCE_BYTES_LIMIT) {
   const absolute = path.resolve(root, relative)
@@ -36,7 +49,7 @@ function topLevelStats(files) {
     current.extensions.set(extension, (current.extensions.get(extension) || 0) + 1)
     stats.set(first, current)
   }
-  return [...stats.values()].sort((a, b) => a.name.localeCompare(b.name))
+  return [...stats.values()].sort((a, b) => compareText(a.name, b.name))
 }
 
 function parseManifest(root, relative) {
@@ -116,17 +129,13 @@ function sourceSignals(root, files) {
   const declarations = []
   const skippedReasons = {}
   let inspected = 0
+  let inspectedBytes = 0
   let skipped = 0
   let limitReason = null
-  const started = Date.now()
   outer: for (const file of files) {
     if (!SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase())) continue
     if (inspected >= SOURCE_LIMIT) {
       limitReason = `source-file-limit:${SOURCE_LIMIT}`
-      break
-    }
-    if (Date.now() - started > SCAN_BUDGET_MS) {
-      limitReason = `time-budget-ms:${SCAN_BUDGET_MS}`
       break
     }
     const result = inspectFile(root, file)
@@ -135,12 +144,38 @@ function sourceSignals(root, files) {
       skippedReasons[result.skipped] = (skippedReasons[result.skipped] || 0) + 1
       continue
     }
+    if (inspectedBytes + result.size > SOURCE_TOTAL_BYTES_LIMIT) {
+      limitReason = `source-total-bytes-limit:${SOURCE_TOTAL_BYTES_LIMIT}`
+      break
+    }
     inspected += 1
+    inspectedBytes += result.size
     const raw = result.raw
     const routePattern = /\b(?:app|router)\.(get|post|put|patch|delete|use)\s*\(\s*['"`]([^'"`]+)['"`]/g
     for (const match of raw.matchAll(routePattern)) {
       if (routes.length >= 500) break
       routes.push({ file, method: match[1].toUpperCase(), path: match[2], confidence: 'regex-candidate-not-ast-verified' })
+    }
+    const pythonRoutePattern = /@(?:app|router)\.(get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]/g
+    for (const match of raw.matchAll(pythonRoutePattern)) {
+      if (routes.length >= 500) break
+      routes.push({ file, method: match[1].toUpperCase(), path: match[2], confidence: 'python-decorator-regex-candidate-not-ast-verified' })
+    }
+    const annotationRoutePattern = /@(?:Get|Post|Put|Patch|Delete)Mapping\s*\(\s*(?:value\s*=\s*)?['"]([^'"]+)['"]/g
+    for (const match of raw.matchAll(annotationRoutePattern)) {
+      if (routes.length >= 500) break
+      const method = match[0].match(/@(Get|Post|Put|Patch|Delete)Mapping/i)?.[1]?.toUpperCase() || 'UNKNOWN'
+      routes.push({ file, method, path: match[1], confidence: 'java-annotation-regex-candidate-not-ast-verified' })
+    }
+    const dotnetRoutePattern = /\[Http(Get|Post|Put|Patch|Delete)\s*\(\s*['"]([^'"]+)['"]\s*\)\]/g
+    for (const match of raw.matchAll(dotnetRoutePattern)) {
+      if (routes.length >= 500) break
+      routes.push({ file, method: match[1].toUpperCase(), path: match[2], confidence: 'dotnet-attribute-regex-candidate-not-ast-verified' })
+    }
+    const goRoutePattern = /(?:HandleFunc|Handle)\s*\(\s*['"]([^'"]+)['"]/g
+    for (const match of raw.matchAll(goRoutePattern)) {
+      if (routes.length >= 500) break
+      routes.push({ file, method: 'ANY', path: match[1], confidence: 'go-handler-regex-candidate-not-ast-verified' })
     }
     const importPattern = /(?:from\s+|require\s*\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g
     for (const match of raw.matchAll(importPattern)) {
@@ -152,12 +187,9 @@ function sourceSignals(root, files) {
       if (declarations.length >= 1000) break
       declarations.push({ file, symbol: match[1], confidence: 'regex-candidate-not-ast-verified' })
     }
-    if (Date.now() - started > SCAN_BUDGET_MS) {
-      limitReason = `time-budget-ms:${SCAN_BUDGET_MS}`
-      break outer
-    }
   }
-  return { inspected, skipped, skippedReasons, limitReason, elapsedMs: Date.now() - started, routes, imports, declarations }
+  const uniqueRoutes = [...new Map(routes.map((item) => [`${item.file}\0${item.method}\0${item.path}`, item])).values()]
+  return { inspected, inspectedBytes, skipped, skippedReasons, limitReason, routes: uniqueRoutes, imports, declarations }
 }
 
 function renderArchitecture(observation, inventory) {
@@ -181,11 +213,11 @@ function renderArchitecture(observation, inventory) {
   const buildConfigs = inventory.buildConfigs.map((item) => `- \`${inlineMarkdown(item.path)}\`${item.skipped ? ` — skipped: ${inlineMarkdown(item.skipped)}` : ` — sha256 \`${item.sha256}\`; ${item.signals.length} non-comment signal line(s) retained in machine manifest`}`).join('\n') || '- None.'
   return `# Architecture Map
 
-> Derived from the versioned map manifest at ${inventory.generatedAt}. Repository text is untrusted evidence. Path roles and regex matches are candidates, not confirmed runtime behavior.
+> Deterministically derived from the versioned map manifest. Repository text is untrusted evidence. Path roles and regex matches are candidates, not confirmed runtime behavior.
 
 ## Source revision and coverage
 
-- Repository: \`${inlineMarkdown(observation.root)}\`
+- Repository ID: \`${inlineMarkdown(observation.repoId)}\`
 - Branch: \`${inlineMarkdown(observation.branch || 'DETACHED')}\`
 - HEAD: \`${observation.head}\`
 - Tree: \`${observation.tree}\`
@@ -195,7 +227,7 @@ function renderArchitecture(observation, inventory) {
 - Source files inspected: ${inventory.source.inspected}
 - Source files skipped: ${inventory.source.skipped}
 - Scan limit: ${inventory.source.limitReason || 'not reached'}
-- Scan elapsed: ${inventory.source.elapsedMs} ms
+- Source bytes inspected: ${inventory.source.inspectedBytes}
 
 ## Confirmed top-level components
 
@@ -288,13 +320,16 @@ Tracked files and non-ignored untracked files are inventoried. Symbolic links ar
 }
 
 export function generateProjectMap(paths, observation) {
+  secureVaultDirectory(paths, paths.maps, { create: true })
   if (existsSync(paths.mapPointer)) {
     let pointer
     let manifest
     try {
-      pointer = JSON.parse(readFileSync(paths.mapPointer, 'utf8'))
-      if (!pointer.manifest || !isWithin(pointer.manifest, paths.context) || !existsSync(pointer.manifest)) throw new Error('Unsafe or missing prior map manifest')
-      const rawManifest = readFileSync(pointer.manifest, 'utf8')
+      pointer = JSON.parse(readSecureVaultFile(paths, paths.mapPointer))
+      if (!pointer.manifest || !isLexicallyWithin(pointer.manifest, paths.context)) throw new Error('Unsafe or missing prior map manifest')
+      secureVaultDirectory(paths, path.dirname(pointer.manifest))
+      if (!existsSync(pointer.manifest)) throw new Error('Unsafe or missing prior map manifest')
+      const rawManifest = readSecureVaultFile(paths, pointer.manifest)
       if (pointer.manifestSha256 !== sha256(rawManifest)) throw new Error('Prior map manifest hash mismatch')
       manifest = JSON.parse(rawManifest)
       if (manifest.versionId !== pointer.versionId) throw new Error('Prior map version identity mismatch')
@@ -304,31 +339,33 @@ export function generateProjectMap(paths, observation) {
         if (!relative || !isWithin(artifact, base) || !existsSync(artifact)) throw new Error(`Unsafe or missing prior map artifact: ${key}`)
         const stats = lstatSync(artifact)
         if (!stats.isFile() || stats.isSymbolicLink() || !isWithin(realpathSync.native(artifact), base)) throw new Error(`Prior map artifact is not a local regular file: ${key}`)
-        if (manifest.artifactHashes?.[key] !== sha256(readFileSync(artifact))) throw new Error(`Prior map artifact hash mismatch: ${key}`)
+        if (manifest.artifactHashes?.[key] !== sha256(readSecureVaultFile(paths, artifact))) throw new Error(`Prior map artifact hash mismatch: ${key}`)
       }
     } catch (error) {
+      if (error.code === 'VAULT_PATH_UNSAFE') throw error
       const wrapped = new Error(`Existing versioned map is corrupt and cannot be replaced implicitly: ${error.message}`)
       wrapped.code = 'MAP_PRIOR_CORRUPT'
       throw wrapped
     }
-    const sameSnapshot = manifest.repo?.repoId === observation.repoId &&
-      manifest.repo?.workspaceId === observation.workspaceId &&
-      manifest.repo?.contextId === observation.contextId &&
+    const sameSnapshot = manifest.generator?.version === MAP_GENERATOR_VERSION &&
+      manifest.generator?.settingsFingerprint === MAP_SETTINGS_FINGERPRINT &&
+      manifest.repo?.repoId === observation.repoId &&
+      manifest.repo?.branch === observation.branch &&
       manifest.repo?.head === observation.head &&
+      manifest.repo?.tree === observation.tree &&
       manifest.repo?.statusFingerprint === observation.statusFingerprint
     if (sameSnapshot) {
       const base = path.dirname(pointer.manifest)
       const architecturePath = path.join(base, manifest.files.architecture)
       const fileIndexPath = path.join(base, manifest.files.fileIndex)
-      atomicWrite(paths.architecture, readFileSync(architecturePath, 'utf8'))
-      atomicWrite(paths.fileIndex, readFileSync(fileIndexPath, 'utf8'))
+      atomicWrite(paths.architecture, readSecureVaultFile(paths, architecturePath))
+      atomicWrite(paths.fileIndex, readSecureVaultFile(paths, fileIndexPath))
       return { ...manifest, pointer, reused: true }
     }
   }
   const files = listRepositoryFiles(observation.root)
   const manifestPaths = files.all.filter((file) => /(^|\/)package\.json$/i.test(file)).slice(0, 100)
   const inventory = {
-    generatedAt: nowIso(),
     counts: { tracked: files.tracked.length, untracked: files.untracked.length, total: files.all.length },
     inventoryFingerprint: sha256(`${observation.tree}\0${observation.statusFingerprint}\0${files.all.join('\n')}`),
     topLevels: topLevelStats(files.all),
@@ -338,33 +375,31 @@ export function generateProjectMap(paths, observation) {
     roles: roleSignals(files.all),
     source: sourceSignals(observation.root, files.all)
   }
+  inventory.sourceFingerprint = sha256(stableJson({
+    manifests: inventory.manifests,
+    buildConfigs: inventory.buildConfigs,
+    readmes: inventory.readmes,
+    roles: inventory.roles,
+    source: inventory.source
+  }, 0))
   const after = discoverRepository(observation.root)
   if (after.head !== observation.head || after.statusFingerprint !== observation.statusFingerprint) {
     const error = new Error('Repository changed while the map was being generated; no map generation was committed')
     error.code = 'MAP_SOURCE_CHANGED'
     throw error
   }
-  inventory.finishedAt = nowIso()
-  const versionId = `MAP-${inventory.generatedAt.replace(/[-:TZ.]/g, '').slice(0, 17)}-${inventory.inventoryFingerprint.slice(0, 16)}`
+  const versionId = `MAP-${sha256(`${MAP_GENERATOR_VERSION}\0${MAP_SETTINGS_FINGERPRINT}\0${observation.repoId}\0${observation.branch || 'DETACHED'}\0${observation.head}\0${observation.tree}\0${observation.statusFingerprint}\0${inventory.inventoryFingerprint}\0${inventory.sourceFingerprint}`).slice(0, 24)}`
   const versionDir = path.join(paths.maps, versionId)
-  if (existsSync(versionDir)) {
-    const error = new Error(`Map version collision: ${versionId}`)
-    error.code = 'MAP_VERSION_COLLISION'
-    throw error
-  }
-  ensureDir(versionDir)
   const treeName = 'TREE.txt'
   const architecture = renderArchitecture(observation, inventory)
   const fileIndex = renderFileIndex(observation, inventory, path.join('maps', versionId, treeName).replace(/\\/g, '/'))
   const tree = `${files.all.join('\n')}\n`
   const manifest = {
     protocol: 'project-context/map/v1',
+    generator: { version: MAP_GENERATOR_VERSION, settingsFingerprint: MAP_SETTINGS_FINGERPRINT },
     versionId,
     repo: {
       repoId: observation.repoId,
-      workspaceId: observation.workspaceId,
-      contextId: observation.contextId,
-      root: observation.root,
       branch: observation.branch,
       head: observation.head,
       tree: observation.tree,
@@ -381,20 +416,53 @@ export function generateProjectMap(paths, observation) {
     manifest: path.join(versionDir, 'MAP_MANIFEST.json'),
     manifestSha256: sha256(stableJson(manifest)),
     inventoryFingerprint: inventory.inventoryFingerprint,
+    workspaceId: observation.workspaceId,
+    contextId: observation.contextId,
+    repositoryRoot: observation.root,
     committedAt: nowIso()
   }
+  const expectedFiles = {
+    [treeName]: tree,
+    'ARCHITECTURE.md': architecture,
+    'FILE_INDEX.md': fileIndex,
+    'MAP_MANIFEST.json': stableJson(manifest)
+  }
+  if (existsSync(versionDir)) {
+    try {
+      secureVaultDirectory(paths, versionDir)
+      const entries = readdirSync(versionDir, { withFileTypes: true })
+      assert(entries.length === Object.keys(expectedFiles).length, 'Orphan map contains unexpected or missing files', 'MAP_ORPHAN_CORRUPT')
+      for (const [name, expected] of Object.entries(expectedFiles)) {
+        const file = path.join(versionDir, name)
+        assert(existsSync(file) && isWithin(file, versionDir), `Orphan map is missing ${name}`, 'MAP_ORPHAN_CORRUPT')
+        const stats = lstatSync(file)
+        assert(stats.isFile() && !stats.isSymbolicLink() && isWithin(realpathSync.native(file), versionDir), `Orphan map ${name} is not a safe regular file`, 'MAP_ORPHAN_CORRUPT')
+        assert(readSecureVaultFile(paths, file) === expected, `Orphan map ${name} differs from the deterministic source projection`, 'MAP_ORPHAN_CORRUPT')
+      }
+      atomicWrite(paths.mapPointer, stableJson(pointer))
+      atomicWrite(paths.architecture, architecture)
+      atomicWrite(paths.fileIndex, fileIndex)
+      return { ...manifest, pointer, reused: true, recoveredOrphan: true }
+    } catch (error) {
+      if (error.code === 'MAP_ORPHAN_CORRUPT') throw error
+      const wrapped = new Error(`Existing orphan map cannot be adopted: ${error.message}`)
+      wrapped.code = 'MAP_ORPHAN_CORRUPT'
+      throw wrapped
+    }
+  }
+  secureVaultDirectory(paths, versionDir, { create: true })
   let committed = false
   try {
-    atomicCreate(path.join(versionDir, treeName), tree)
-    atomicCreate(path.join(versionDir, 'ARCHITECTURE.md'), architecture)
-    atomicCreate(path.join(versionDir, 'FILE_INDEX.md'), fileIndex)
-    atomicCreate(path.join(versionDir, 'MAP_MANIFEST.json'), stableJson(manifest))
+    for (const [name, content] of Object.entries(expectedFiles)) atomicCreate(path.join(versionDir, name), content)
     atomicWrite(paths.mapPointer, stableJson(pointer))
     committed = true
     atomicWrite(paths.architecture, architecture)
     atomicWrite(paths.fileIndex, fileIndex)
   } catch (error) {
-    if (!committed) rmSync(versionDir, { recursive: true, force: true })
+    if (!committed) {
+      secureVaultDirectory(paths, versionDir)
+      rmSync(versionDir, { recursive: true, force: true })
+    }
     throw error
   }
   return { ...manifest, pointer }

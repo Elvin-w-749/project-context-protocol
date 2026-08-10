@@ -8,6 +8,8 @@ import { cli, findFiles, parseJsonFile, withFixture } from './run-tests.mjs'
 
 const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const ADAPTER = path.join(PROJECT_ROOT, 'skills', 'project-context-protocol', 'scripts', 'context-adapter.mjs')
+const configuredChildTimeout = Number.parseInt(process.env.CONTEXT_PROTOCOL_TEST_CHILD_TIMEOUT_MS || '120000', 10)
+const CHILD_TIMEOUT_MS = Number.isInteger(configuredChildTimeout) && configuredChildTimeout > 0 ? configuredChildTimeout : 120000
 
 function embeddedJson(value) {
   const text = String(value || '').trim()
@@ -39,6 +41,7 @@ function adapter(command, args = {}, options = {}) {
     cwd: PROJECT_ROOT,
     encoding: 'utf8',
     windowsHide: true,
+    timeout: options.timeout ?? CHILD_TIMEOUT_MS,
     maxBuffer: 128 * 1024 * 1024,
     env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' }
   })
@@ -92,6 +95,108 @@ test('session-start fails safely when no unique task can be adopted', () => {
     assert.equal(result.json.recovery.vaultSelection.currentSessionDeclarationRecorded, true)
     assert.equal(result.json.capture.degraded, true)
     assert.match(result.json.capture.warning, /No installed lifecycle Hook/i)
+  })
+})
+
+test('session-start rejects an unknown route event before creating a run or touching the selected store', () => {
+  withFixture(({ repo, vault }) => {
+    const result = adapter('session-start', {
+      repo,
+      vault,
+      task: 'Reject route typos before begin',
+      'route-event': 'deply'
+    }, { allowFailure: true })
+    assert.notEqual(result.status, 0)
+    assert.equal(result.json.error.code, 'ROUTE_SIGNAL_UNKNOWN')
+    assert.equal(existsSync(vault), false)
+  })
+})
+
+test('session-start rejects an explicitly blank route event before touching the selected store', () => {
+  withFixture(({ repo, vault }) => {
+    const result = adapter('session-start', {
+      repo,
+      vault,
+      task: 'Reject an explicitly blank route signal',
+      'route-event': ''
+    }, { allowFailure: true })
+    assert.notEqual(result.status, 0)
+    assert.equal(result.json.error.code, 'ROUTE_SIGNAL_EMPTY')
+    assert.equal(existsSync(vault), false)
+  })
+})
+
+test('session-start adopts a persisted UNMANAGED registration through begin and keeps capture declarations consistent', () => {
+  withFixture(({ repo, vault }) => {
+    const unmanaged = cli('register', { args: { repo, vault } }).json
+    assert.equal(unmanaged.recovery.trust.status, 'UNMANAGED')
+
+    const started = adapter('session-start', {
+      repo,
+      vault,
+      task: 'Adopt the first managed task without a circular run requirement',
+      'hook-mediated': true
+    }).json
+    assert.equal(started.started, true)
+    assert.equal(started.route.executable, true)
+    assert.equal(started.capture.coverage, 'mediated-supported-lifecycle-events')
+    assert.equal(started.recovery.capture.coverage, started.capture.coverage)
+    assert.match(started.recovery.capture.mode, /context-adapter\/lifecycle-hook/)
+  })
+})
+
+test('adapter-created runs preserve the current-session record layout selection', () => {
+  withFixture(({ repo, vault }) => {
+    const started = adapter('session-start', {
+      repo,
+      store: vault,
+      'store-confirmed-by-user': true,
+      'record-layout': 'hybrid',
+      task: 'Bind the selected record layout into the run'
+    }).json
+    assert.equal(started.started, true)
+    assert.equal(started.recovery.recordLayout, 'hybrid')
+    assert.equal(started.recovery.vaultSelection.recordLayout, 'hybrid')
+    assert.equal(runRecord(vault, started.runId).value.vaultSelection.recordLayout, 'hybrid')
+  })
+})
+
+test('the new store interface carries its explicit layout through the full adapter lifecycle', () => {
+  withFixture(({ repo, vault }) => {
+    const common = { repo, store: vault, 'record-layout': 'hybrid' }
+    const started = adapter('session-start', {
+      ...common,
+      'store-confirmed-by-user': true,
+      task: 'Exercise the explicit-layout adapter lifecycle'
+    }).json
+    assert.equal(started.recovery.recordLayout, 'hybrid')
+    const authenticated = { ...common, run: started.runId, session: started.session }
+    assert.equal(adapter('heartbeat', { ...authenticated, summary: 'Renewed explicit-layout lifecycle.' }).json.leaseRenewed, true)
+    assert.equal(adapter('checkpoint', { ...authenticated, event: 'observation', summary: 'Recorded explicit-layout lifecycle checkpoint.' }).json.checkpoint.command, 'checkpoint')
+    const stopped = adapter('session-stop', { ...authenticated, summary: 'Closed explicit-layout lifecycle as partial.' }).json
+    assert.equal(stopped.finished.status, 'partial')
+    assert.equal(runRecord(vault, started.runId).value.vaultSelection.recordLayout, 'hybrid')
+  })
+})
+
+test('session-start can return a high-risk recording route without executing the host action', () => {
+  withFixture(({ repo, vault }) => {
+    const started = adapter('session-start', {
+      repo,
+      store: vault,
+      'store-confirmed-by-user': true,
+      'record-layout': 'hybrid',
+      task: 'Record a host-governed push boundary',
+      'route-event': 'push',
+      authority: 'The current user authorizes the host to decide whether to push.',
+      'current-session-authority': true
+    })
+    assert.equal(started.status, 0)
+    assert.equal(started.json.started, true)
+    assert.equal(started.json.route.mode, 'release-with-provenance')
+    assert.equal(started.json.route.recordingReady, true)
+    assert.equal(started.json.route.executable, false)
+    assert.equal(started.json.route.protocolExecutesAction, false)
   })
 })
 
@@ -180,6 +285,25 @@ test('session-stop never infers completed status', () => {
     }, { allowFailure: true })
     assert.notEqual(rejected.status, 0)
     assert.equal(rejected.json.error.code, 'ADAPTER_COMPLETION_NOT_INFERRED')
+    assert.equal(runRecord(vault, started.runId).value.status, 'active')
+  })
+})
+
+test('an invalid session-stop status leaves the immutable event chain and run record unchanged', () => {
+  withFixture(({ repo, vault }) => {
+    const started = adapter('session-start', { repo, vault, task: 'Reject invalid lifecycle status without side effects' }).json
+    const before = vaultSnapshot(vault)
+    const rejected = adapter('session-stop', {
+      repo,
+      vault,
+      run: started.runId,
+      session: started.session,
+      status: 'done',
+      summary: 'This invalid status must not append a handoff.'
+    }, { allowFailure: true })
+    assert.notEqual(rejected.status, 0)
+    assert.equal(rejected.json.error.code, 'RUN_STATUS_INVALID')
+    assert.deepEqual(vaultSnapshot(vault), before)
     assert.equal(runRecord(vault, started.runId).value.status, 'active')
   })
 })

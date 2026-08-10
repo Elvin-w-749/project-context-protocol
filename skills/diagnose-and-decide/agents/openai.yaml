@@ -1,6 +1,0 @@
-interface:
-  display_name: "Diagnose and Decide"
-  short_description: "Diagnose from evidence while preserving solution freedom"
-  default_prompt: "Use $diagnose-and-decide to investigate this problem and record the chosen path."
-policy:
-  allow_implicit_invocation: false

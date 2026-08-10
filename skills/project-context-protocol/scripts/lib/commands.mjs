@@ -15,11 +15,16 @@ import {
   inspectVaultAcl,
   listRuns,
   loadState,
+  readRunEvents,
+  readSecureVaultFile,
+  rehardenVaultAcl,
   refreshRunView,
   renewRunLease,
   renderArchitectureView,
   renderProjectContext,
+  renderProjectProfile,
   saveRunRecord,
+  secureVaultDirectory,
   runLeaseStatus,
   validateVaultLocation,
   vaultPaths,
@@ -35,16 +40,19 @@ import {
   ensureDir,
   hmacSha256,
   inlineMarkdown,
+  isLexicallyWithin,
   isWithin,
   nowIso,
   parseInteger,
   randomId,
   readJson,
+  redactSensitiveText,
   secureHexEqual,
   sha256,
   sha256File,
   splitList,
   stableJson,
+  tableMarkdown,
   unique,
   writeJsonAtomic
 } from './util.mjs'
@@ -55,10 +63,20 @@ const FINISH_STATUSES = new Set(['completed', 'partial', 'blocked'])
 const LIFECYCLE_EVENTS = new Set(['commit', 'push', 'deploy', 'rollback', 'acceptance', 'delete', 'export', 'import', 'model-access'])
 const LIFECYCLE_OUTCOMES = new Set(['planned', 'started', 'succeeded', 'failed', 'partial', 'cancelled', 'blocked-unauthorized', 'unknown'])
 const EVIDENCE_KINDS = new Set(['attachment', 'command-output', 'manifest', 'remote-ref', 'deployment-response', 'health-check', 'user-confirmation', 'api-response', 'log', 'test-report'])
+const RECORD_LAYOUTS = new Set(['vault', 'markdown', 'hybrid'])
 const BUILTIN_RELEASE_OBSERVERS = Object.freeze({
   commit: 'live-git-commit-observer',
   push: 'live-git-remote-ref-observer'
 })
+const ROUTE_SIGNALS = new Set([
+  'session-start', 'continue',
+  'task-change', 'authorization-change', 'new-task', 'authority',
+  'commit', 'push', 'deploy', 'rollback', 'acceptance', 'delete', 'export', 'import', 'model-access', 'secret-disclosure',
+  'error', 'failure', 'contradiction', 'test-failure', 'diagnose',
+  'impact', 'architecture', 'file-map', 'map',
+  'complete', 'completion', 'verify', 'handoff',
+  'session-end', 'compaction', 'stop'
+])
 
 function required(args, key, message = `--${key} is required`) {
   const value = args[key]
@@ -74,29 +92,54 @@ function validatedLeaseSeconds(args) {
 }
 
 function explicitVault(args) {
-  const value = args.vault
+  const store = args.store
+  const legacyVault = args.vault
+  if (store !== undefined && store !== true && legacyVault !== undefined && legacyVault !== true) {
+    assert(path.resolve(String(store)) === path.resolve(String(legacyVault)), '--store and --vault refer to different locations', 'STORE_LOCATION_CONFLICT')
+  }
+  const value = store !== undefined ? store : legacyVault
   assert(
     value !== undefined && value !== true && String(value).trim() !== '',
-    '--vault is required. Ask the user where this session may store or read the local Vault; never infer a drive or directory.',
+    '--store (or legacy --vault) is required. Ask the current user for one explicit absolute project-context location; never infer a drive or directory.',
     'VAULT_LOCATION_REQUIRED'
   )
   const selected = String(value).trim()
-  assert(path.isAbsolute(selected), '--vault must be the absolute path explicitly selected by the current user', 'VAULT_LOCATION_ABSOLUTE_REQUIRED')
+  assert(path.isAbsolute(selected), '--store must be the absolute path explicitly selected by the current user', 'VAULT_LOCATION_ABSOLUTE_REQUIRED')
   return selected
+}
+
+function selectedRecordLayout(args, fallback = 'vault') {
+  const explicitlySelected = args['record-layout'] !== undefined && args['record-layout'] !== true && String(args['record-layout']).trim() !== ''
+  assert(
+    explicitlySelected || args.store === undefined,
+    '--record-layout is required whenever the new --store interface is used; ask the current user to choose vault, markdown, or hybrid for this session',
+    'RECORD_LAYOUT_REQUIRED'
+  )
+  const value = explicitlySelected ? String(args['record-layout']).trim().toLowerCase() : fallback
+  assert(RECORD_LAYOUTS.has(value), '--record-layout must be vault, markdown, or hybrid', 'RECORD_LAYOUT_INVALID')
+  return value
+}
+
+function assertRecordLayout(bundle, args) {
+  if (!bundle || args['record-layout'] === undefined) return
+  const requested = selectedRecordLayout(args)
+  const recorded = bundle.state.recordLayout || 'vault'
+  assert(requested === recorded, `This context uses record layout ${recorded}; explicit migration is required before selecting ${requested}`, 'RECORD_LAYOUT_CONFLICT')
 }
 
 function requireUserConfirmedVault(args, operation) {
   explicitVault(args)
   assert(
-    args['vault-confirmed-by-user'] === true,
-    `${operation} requires --vault-confirmed-by-user after the current user explicitly selects the Vault path for this session`,
+    args['store-confirmed-by-user'] === true || args['vault-confirmed-by-user'] === true,
+    `${operation} requires --store-confirmed-by-user (or legacy --vault-confirmed-by-user) after the current user explicitly selects the storage path for this session`,
     'VAULT_LOCATION_CONFIRMATION_REQUIRED'
   )
 }
 
-function vaultSelectionRecord(vault, operation) {
+function vaultSelectionRecord(vault, operation, recordLayout = 'vault') {
   return {
     path: path.resolve(vault),
+    recordLayout,
     currentUserSelectionDeclared: true,
     declarationScope: 'current-session-explicit-path',
     operation,
@@ -108,7 +151,8 @@ function vaultSelectionRecord(vault, operation) {
 function inputs(args) {
   return {
     repo: path.resolve(args.repo && args.repo !== true ? String(args.repo) : process.cwd()),
-    vault: path.resolve(explicitVault(args))
+    vault: path.resolve(explicitVault(args)),
+    recordLayout: selectedRecordLayout(args)
   }
 }
 
@@ -210,7 +254,7 @@ function safeStateSummary(bundle) {
 
 function mapReference(manifest, paths) {
   return {
-    generatedAt: manifest.generatedAt,
+    generatedAt: manifest.pointer?.committedAt || manifest.generatedAt || null,
     head: manifest.repo.head,
     tree: manifest.repo.tree,
     statusFingerprint: manifest.repo.statusFingerprint,
@@ -224,8 +268,50 @@ function mapReference(manifest, paths) {
   }
 }
 
+function loadMapManifest(state, paths) {
+  const manifestPath = state.map?.manifest
+  if (!manifestPath || !path.isAbsolute(manifestPath) || !isLexicallyWithin(manifestPath, paths.context)) return null
+  try {
+    secureVaultDirectory(paths, path.dirname(manifestPath))
+    if (!existsSync(manifestPath)) return null
+    return JSON.parse(readSecureVaultFile(paths, manifestPath))
+  } catch (error) {
+    if (error.code === 'VAULT_PATH_UNSAFE') throw error
+    return null
+  }
+}
+
+function projectProfile(args, prior, manifest, observation) {
+  const userFields = ['project-name', 'project-summary', 'project-purpose', 'project-audience', 'project-role', 'project-boundaries', 'project-risks']
+    .some((key) => args[key] !== undefined)
+  const primaryManifest = (manifest?.manifests || []).find((item) => !item.error) || null
+  const readme = (manifest?.readmes || []).find((item) => item.firstParagraph) || null
+  const keyCommands = (manifest?.manifests || []).flatMap((item) => Object.entries(item.scripts || {}).map(([name, command]) => ({ name: clip(name, 100), command: clip(command, 500), manifest: clip(item.path, 240) }))).slice(0, 30)
+  const components = (manifest?.topLevels || []).slice(0, 40).map((item) => ({ path: clip(item.name, 240), role: 'confirmed top-level inventory', files: item.files }))
+  const rawSummary = args['project-summary'] && args['project-summary'] !== true
+    ? String(args['project-summary'])
+    : prior?.summary || primaryManifest?.description || readme?.firstParagraph || null
+  const summary = rawSummary ? clip(rawSummary, 1200) : null
+  return {
+    name: clip(args['project-name'] && args['project-name'] !== true ? String(args['project-name']) : prior?.name || primaryManifest?.name || path.basename(observation.root), 180),
+    summary,
+    purpose: clip(args['project-purpose'] && args['project-purpose'] !== true ? String(args['project-purpose']) : prior?.purpose || summary, 1200),
+    audience: clip(args['project-audience'] && args['project-audience'] !== true ? String(args['project-audience']) : prior?.audience || '', 600) || null,
+    repositoryRole: clip(args['project-role'] && args['project-role'] !== true ? String(args['project-role']) : prior?.repositoryRole || '', 400) || null,
+    boundaries: (args['project-boundaries'] !== undefined ? splitList(args['project-boundaries']) : prior?.boundaries || []).slice(0, 30).map((item) => clip(item, 400)),
+    risks: (args['project-risks'] !== undefined ? splitList(args['project-risks']) : prior?.risks || []).slice(0, 30).map((item) => clip(item, 400)),
+    components: components.length > 0 ? components : prior?.components || [],
+    keyCommands: keyCommands.length > 0 ? keyCommands : prior?.keyCommands || [],
+    source: userFields ? 'user-supplied fields plus bounded repository-map facts' : 'bounded repository-map inference; user confirmation not recorded',
+    userConfirmed: Boolean(userFields && args['current-session-authority']),
+    mapVersion: manifest?.versionId || prior?.mapVersion || null,
+    updatedAt: nowIso()
+  }
+}
+
 function routeToken(bundle, observation, runId = null) {
   return sha256([
+    bundle.state.repo.projectId || observation.repoId,
     observation.repoId,
     observation.workspaceId,
     observation.contextId,
@@ -257,14 +343,26 @@ function protocolKeyStatus(paths) {
 
 function externalApprovalStatus() {
   return {
-    valid: false,
-    reason: 'STANDALONE_HIGH_RISK_EXECUTION_DISABLED: version 1 records high-risk events but never executes them; no Agent-configurable approval provider is accepted.'
+    evaluatedByProtocol: false,
+    requiredByProtocol: false,
+    authority: 'external-to-protocol',
+    reason: 'Current user and host-platform authorization remain external. The protocol records a current-session declaration but does not grant or deny the host action.'
   }
 }
 
 function normalizedSignals(signals) {
   return unique(signals.map((item) => String(item).trim().toLowerCase()).filter(Boolean)).sort()
 }
+
+export function validateRouteSignals(signals) {
+  const normalized = normalizedSignals(signals)
+  assert(normalized.length > 0, 'At least one non-empty route signal is required', 'ROUTE_SIGNAL_EMPTY')
+  const unknown = normalized.filter((signal) => !ROUTE_SIGNALS.has(signal))
+  assert(unknown.length === 0, `Unknown route signal(s): ${unknown.join(', ')}`, 'ROUTE_SIGNAL_UNKNOWN')
+  return normalized
+}
+
+const validatedRouteSignals = validateRouteSignals
 
 function encodeRouteCredential(payload, key) {
   const body = Buffer.from(stableJson(payload, 0).trim(), 'utf8').toString('base64url')
@@ -285,7 +383,7 @@ function decodeRouteCredential(token, key) {
 }
 
 function selectMode(trust, state, signals, activeRunId) {
-  const normalized = new Set(signals.map((item) => item.toLowerCase()))
+  const normalized = new Set(validatedRouteSignals(signals))
   if (!['READY'].includes(trust.status)) return { mode: 'recover-context', reason: `Trust is ${trust.status}.` }
   if (!activeRunId) return { mode: 'confirm-intent', reason: 'This Agent session has no authenticated run; begin one before project work.' }
   if (['task-change', 'authorization-change', 'new-task', 'authority'].some((item) => normalized.has(item))) return { mode: 'confirm-intent', reason: 'The current task or authorization changed.' }
@@ -302,6 +400,7 @@ function credentialPayload(bundle, observation, mode, signals, authority, active
   return {
     protocol: 'project-context/route/v1',
     keyId,
+    projectId: bundle.state.repo.projectId || observation.repoId,
     repoId: observation.repoId,
     workspaceId: observation.workspaceId,
     contextId: observation.contextId,
@@ -346,6 +445,7 @@ function runIntegrityProblems(paths, runId) {
     if (!check.sequencesValid) problems.push('event sequence is invalid')
     return problems
   } catch (error) {
+    if (error.code === 'VAULT_PATH_UNSAFE') throw error
     return [`run integrity could not be verified: ${error.code || error.message}`]
   }
 }
@@ -479,18 +579,24 @@ function knownVaultContentHashes(paths, bundle) {
     }
   }
   if (existsSync(paths.evidence)) {
+    secureVaultDirectory(paths, paths.evidence)
     for (const runEntry of readdirSync(paths.evidence, { withFileTypes: true })) {
-      if (!runEntry.isDirectory() || runEntry.isSymbolicLink()) continue
-      const runRoot = path.join(paths.evidence, runEntry.name)
+      assert(!runEntry.isSymbolicLink(), `Evidence run ${runEntry.name} must not be a link or junction`, 'VAULT_PATH_UNSAFE')
+      if (!runEntry.isDirectory()) continue
+      const runRoot = secureVaultDirectory(paths, path.join(paths.evidence, runEntry.name))
       for (const evidenceEntry of readdirSync(runRoot, { withFileTypes: true })) {
-        if (!evidenceEntry.isDirectory() || evidenceEntry.isSymbolicLink()) continue
-        const metadata = path.join(runRoot, evidenceEntry.name, 'evidence.json')
+        assert(!evidenceEntry.isSymbolicLink(), `Evidence item ${evidenceEntry.name} must not be a link or junction`, 'VAULT_PATH_UNSAFE')
+        if (!evidenceEntry.isDirectory()) continue
+        const evidenceRoot = secureVaultDirectory(paths, path.join(runRoot, evidenceEntry.name))
+        const metadata = path.join(evidenceRoot, 'evidence.json')
         try {
           if (!existsSync(metadata)) continue
-          const record = readJson(metadata)
+          const raw = readSecureVaultFile(paths, metadata)
+          const record = JSON.parse(raw)
           if (record.sha256) hashes.add(record.sha256)
-          hashes.add(sha256File(metadata))
-        } catch {
+          hashes.add(sha256(raw))
+        } catch (error) {
+          if (error.code === 'VAULT_PATH_UNSAFE') throw error
           // A corrupt evidence record is blocked by trust/verify.
         }
       }
@@ -550,9 +656,11 @@ function mapIntegrityProblems(paths, state) {
   const problems = []
   try {
     const manifestPath = path.resolve(state.map.manifest)
-    if (!isWithin(manifestPath, paths.context) || !existsSync(manifestPath) || !lstatSync(manifestPath).isFile() || lstatSync(manifestPath).isSymbolicLink()) return ['The versioned map manifest is missing or unsafe.']
-    const manifest = readJson(manifestPath)
-    const pointer = existsSync(paths.mapPointer) ? readJson(paths.mapPointer) : null
+    if (!isLexicallyWithin(manifestPath, paths.context)) return ['The versioned map manifest is missing or unsafe.']
+    secureVaultDirectory(paths, path.dirname(manifestPath))
+    if (!existsSync(manifestPath) || !lstatSync(manifestPath).isFile() || lstatSync(manifestPath).isSymbolicLink()) return ['The versioned map manifest is missing or unsafe.']
+    const manifest = JSON.parse(readSecureVaultFile(paths, manifestPath))
+    const pointer = existsSync(paths.mapPointer) ? JSON.parse(readSecureVaultFile(paths, paths.mapPointer)) : null
     if (!pointer || pointer.manifest !== manifestPath || pointer.versionId !== manifest.versionId || pointer.manifestSha256 !== sha256(stableJson(manifest))) problems.push('The map pointer does not authenticate the current manifest.')
     const stateBindings = [
       ['versionId', manifest.versionId],
@@ -568,9 +676,10 @@ function mapIntegrityProblems(paths, state) {
     for (const [key, relative] of Object.entries(manifest.files || {})) {
       const file = path.resolve(base, relative)
       if (!isWithin(file, base) || !existsSync(file) || !lstatSync(file).isFile() || lstatSync(file).isSymbolicLink()) problems.push(`Map artifact ${key} is missing or unsafe.`)
-      else if (manifest.artifactHashes?.[key] !== sha256File(file)) problems.push(`Map artifact ${key} hash mismatch.`)
+      else if (manifest.artifactHashes?.[key] !== sha256(readSecureVaultFile(paths, file))) problems.push(`Map artifact ${key} hash mismatch.`)
     }
   } catch (error) {
+    if (error.code === 'VAULT_PATH_UNSAFE') throw error
     problems.push(`The versioned map cannot be validated: ${error.message}`)
   }
   return unique(problems)
@@ -691,44 +800,26 @@ function clip(value, limit = 240) {
 function boundedTask(task) {
   if (!task) return null
   return {
-    ...task,
+    id: safeSummary(task.id, 120),
     title: safeSummary(task.title, 180),
     objective: safeSummary(task.objective, 320),
     reason: safeSummary(task.reason, 240),
+    priority: safeSummary(task.priority, 80),
     requirement: safeSummary(task.requirement, 320),
+    status: safeSummary(task.status, 40),
+    prd: task.prd ? {
+      path: task.prd.path,
+      sha256: task.prd.sha256,
+      approval: safeSummary(task.prd.approval, 80),
+      sections: (task.prd.sections || []).slice(0, 12).map((item) => safeSummary(item, 100))
+    } : null,
     allowedActions: (task.allowedActions || []).slice(0, 10).map((item) => safeSummary(item, 100)),
     prohibitedActions: (task.prohibitedActions || []).slice(0, 10).map((item) => safeSummary(item, 100))
   }
 }
 
-function redactSecrets(value, { highEntropy = true } = {}) {
-  if (value === null || value === undefined) return value
-  const protocolIds = []
-  const protectProtocolIdentifier = (match) => {
-    const marker = `PCPID${protocolIds.length}END`
-    protocolIds.push(match)
-    return marker
-  }
-  let redacted = String(value)
-    .replace(/\bgeneration-\d{8}(?:-[a-f0-9]{12})?\.json\b/gi, protectProtocolIdentifier)
-    .replace(/\b(?:RUN|EVID|CLAIM|ARCH|ISSUE|TASK|PIT|MAP|EXPORT|IMPORT|DECISION|ATTEMPT|CORR|CHANGE)-[A-Za-z0-9_-]+\b/g, protectProtocolIdentifier)
-  redacted = redacted
-    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/gi, '[REDACTED_PRIVATE_KEY]')
-    .replace(/\b(?:github_pat_|gh[pousr]_|AKIA|ASIA)[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_CREDENTIAL]')
-    .replace(/\b(?:sk|ak|pk|rk)-[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED_CREDENTIAL]')
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, 'Bearer [REDACTED_TOKEN]')
-    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|cookie)\s*[:=]\s*)["']?[^\s,;"']+/gi, '$1[REDACTED]')
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]')
-    .replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, '[REDACTED_PHONE]')
-    .replace(/(?<!\d)\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx](?!\d)/g, '[REDACTED_ID]')
-    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[REDACTED_EMAIL]')
-  if (highEntropy) redacted = redacted.replace(/\b(?=[A-Za-z0-9_+/=-]{32,}\b)(?=[A-Za-z0-9_+/=-]*[A-Za-z])(?=[A-Za-z0-9_+/=-]*\d)[A-Za-z0-9_+/=-]+\b/g, '[REDACTED_HIGH_ENTROPY_TOKEN]')
-  redacted = redacted.replace(/PCPID(\d+)END/g, (_, index) => protocolIds[Number(index)] || '[INVALID_PROTOCOL_ID]')
-  return redacted
-}
-
 function safeSummary(value, length) {
-  return clip(redactSecrets(value), length)
+  return clip(redactSensitiveText(value), length)
 }
 
 function safeProjection(value, depth = 0, field = '') {
@@ -736,7 +827,7 @@ function safeProjection(value, depth = 0, field = '') {
   const structuredField = /(?:^|_)(?:id|hash|sha256|head|tree|revision|fingerprint|generation|branch|path|file|root|protocol|status|mode|time|at|count|size|dirty|evidence|reference|binding|remote)$/i.test(field)
     || /(?:Id|Hash|Sha256|Fingerprint|Path|File|Root|At|Count|Revision|Event|Evidence|Reference|Binding)$/i.test(field)
     || /^(?:architecture|projectContext|fileIndex|manifest|pointer|runMarkdown|machineState|vault|context)$/i.test(field)
-  if (typeof value === 'string') return redactSecrets(value, { highEntropy: !structuredField })
+  if (typeof value === 'string') return redactSensitiveText(value, { highEntropy: !structuredField })
   if (Array.isArray(value)) return value.map((item) => safeProjection(item, depth + 1, field))
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, safeProjection(item, depth + 1, key)]))
   return value
@@ -744,25 +835,159 @@ function safeProjection(value, depth = 0, field = '') {
 
 function boundedRecords(records, count = 8) {
   return (records || []).slice(-count).map((item) => typeof item === 'string' ? safeSummary(item, 220) : {
-    ...item,
+    id: safeSummary(item.id, 120),
+    taskId: safeSummary(item.taskId, 120),
+    type: safeSummary(item.type, 80),
+    status: safeSummary(item.status, 80),
     statement: safeSummary(item.statement, 220),
     scope: safeSummary(item.scope, 160),
     limits: safeSummary(item.limits, 160),
+    observedAt: item.observedAt || null,
+    revision: item.revision || null,
     evidence: (item.evidence || []).slice(0, 6).map((entry) => safeSummary(entry, 160))
   })
+}
+
+function recoveryTokenEstimate(value) {
+  const text = typeof value === 'string' ? value : stableJson(value, 0)
+  const cjk = (text.match(/[\u3400-\u9fff\uf900-\ufaff]/g) || []).length
+  return cjk + Math.ceil((text.length - cjk) / 3)
+}
+
+function finalizeRecoveryCard(input) {
+  const maximumBytes = 24 * 1024
+  const maximumEstimatedTokens = 1800
+  const maximumPayloadBytes = maximumBytes - 512
+  const maximumPayloadTokens = maximumEstimatedTokens - 120
+  let card = safeProjection({ schema: 'project-context/recovery-card/v2', ...input })
+  let bytes = Buffer.byteLength(stableJson(card, 0), 'utf8')
+  let tokens = recoveryTokenEstimate(card)
+  let truncated = false
+  if (bytes > maximumPayloadBytes || tokens > maximumPayloadTokens) {
+    truncated = true
+    card = {
+      schema: card.schema,
+      trust: card.trust,
+      recordLayout: card.recordLayout,
+      vaultSelection: card.vaultSelection,
+      repository: card.repository,
+      task: card.task,
+      requirement: card.requirement,
+      progress: (card.progress || []).slice(-3),
+      blockers: (card.blockers || []).slice(-3),
+      confirmedFacts: (card.confirmedFacts || []).slice(-3),
+      hypotheses: (card.hypotheses || []).slice(-3),
+      activeRuns: (card.activeRuns || []).slice(-2),
+      lastRun: card.lastRun,
+      next: card.next,
+      capture: card.capture,
+      references: card.references,
+      stateHash: card.stateHash,
+      stateBindingHash: card.stateBindingHash
+    }
+    bytes = Buffer.byteLength(stableJson(card, 0), 'utf8')
+    tokens = recoveryTokenEstimate(card)
+  }
+  if (bytes > maximumPayloadBytes || tokens > maximumPayloadTokens) {
+    truncated = true
+    card = {
+      schema: card.schema,
+      trust: {
+        status: card.trust?.status || 'CONFLICT',
+        reasons: (card.trust?.reasons || []).slice(0, 2).map((item) => safeSummary(item, 180))
+      },
+      recordLayout: card.recordLayout || card.vaultSelection?.recordLayout || 'vault',
+      vaultSelection: {
+        path: safeSummary(card.vaultSelection?.path, 360),
+        recordLayout: card.vaultSelection?.recordLayout || card.recordLayout || 'vault',
+        currentSessionDeclarationRecorded: card.vaultSelection?.currentSessionDeclarationRecorded === true
+      },
+      repository: {
+        projectId: card.repository?.projectId || null,
+        repoId: card.repository?.repoId || null,
+        workspaceId: card.repository?.workspaceId || null,
+        contextId: card.repository?.contextId || null,
+        root: safeSummary(card.repository?.root, 360),
+        branch: safeSummary(card.repository?.branch, 120),
+        head: card.repository?.head || null,
+        dirty: Boolean(card.repository?.dirty)
+      },
+      task: card.task ? { id: card.task.id || null, title: safeSummary(card.task.title, 160), objective: safeSummary(card.task.objective, 220) } : null,
+      next: { objective: safeSummary(card.next?.objective, 220), prohibited: (card.next?.prohibited || []).slice(0, 3).map((item) => safeSummary(item, 100)) },
+      blockers: (card.blockers || []).slice(-2),
+      capture: card.capture,
+      references: {
+        vault: safeSummary(card.references?.vault || card.vaultSelection?.path, 360),
+        machineState: safeSummary(card.references?.machineState, 360),
+        projectContext: safeSummary(card.references?.projectContext, 360)
+      },
+      stateHash: card.stateHash || null,
+      stateBindingHash: card.stateBindingHash || null
+    }
+  }
+  bytes = Buffer.byteLength(stableJson(card, 0), 'utf8')
+  tokens = recoveryTokenEstimate(card)
+  if (bytes > maximumPayloadBytes || tokens > maximumPayloadTokens) {
+    truncated = true
+    card = {
+      schema: card.schema,
+      trust: {
+        status: card.trust?.status || 'CONFLICT',
+        reasons: (card.trust?.reasons || []).slice(0, 1).map((item) => safeSummary(item, 120))
+      },
+      recordLayout: card.recordLayout || card.vaultSelection?.recordLayout || 'vault',
+      vaultSelection: {
+        path: safeSummary(card.vaultSelection?.path, 240),
+        currentSessionDeclarationRecorded: card.vaultSelection?.currentSessionDeclarationRecorded === true
+      },
+      repository: {
+        projectId: card.repository?.projectId || null,
+        repoId: card.repository?.repoId || null,
+        workspaceId: card.repository?.workspaceId || null,
+        contextId: card.repository?.contextId || null,
+        root: safeSummary(card.repository?.root, 240),
+        branch: safeSummary(card.repository?.branch, 80),
+        head: card.repository?.head || null,
+        dirty: Boolean(card.repository?.dirty)
+      },
+      task: card.task ? { id: card.task.id || null, title: safeSummary(card.task.title, 120) } : null,
+      next: {
+        objective: safeSummary(card.next?.objective, 160),
+        prohibited: (card.next?.prohibited || []).slice(0, 2).map((item) => safeSummary(item, 80))
+      },
+      references: {
+        vault: safeSummary(card.references?.vault || card.vaultSelection?.path, 240),
+        machineState: safeSummary(card.references?.machineState, 240),
+        projectContext: safeSummary(card.references?.projectContext, 240)
+      },
+      stateHash: card.stateHash || null,
+      stateBindingHash: card.stateBindingHash || null
+    }
+  }
+  card.budget = { maximumBytes, maximumEstimatedTokens, actualBytes: 0, estimatedTokens: 0, truncated }
+  for (let pass = 0; pass < 4; pass += 1) {
+    card.budget.actualBytes = Buffer.byteLength(stableJson(card, 0), 'utf8')
+    card.budget.estimatedTokens = recoveryTokenEstimate(card)
+  }
+  assert(card.budget.actualBytes === Buffer.byteLength(stableJson(card, 0), 'utf8'), 'Recovery Card byte accounting did not converge', 'RECOVERY_CARD_BUDGET_ACCOUNTING_FAILED')
+  assert(card.budget.estimatedTokens === recoveryTokenEstimate(card), 'Recovery Card token estimate did not converge', 'RECOVERY_CARD_BUDGET_ACCOUNTING_FAILED')
+  assert(card.budget.actualBytes <= maximumBytes && card.budget.estimatedTokens <= maximumEstimatedTokens, 'Recovery Card exceeded its hard context budget after bounded projection', 'RECOVERY_CARD_BUDGET_EXCEEDED')
+  return card
 }
 
 function recoveryCard(bundle, observation, paths, currentSelection) {
   const trust = classifyTrust(bundle, observation, paths)
   const vaultSelection = {
     path: paths.vault,
+    recordLayout: currentSelection?.recordLayout || bundle?.state?.recordLayout || 'vault',
     currentSessionDeclarationRecorded: currentSelection?.currentUserSelectionDeclared === true,
     declarationScope: currentSelection?.declarationScope || null,
     declarationRecordedAt: currentSelection?.declarationRecordedAt || null
   }
   if (!bundle) {
-    return {
+    return finalizeRecoveryCard({
       trust,
+      recordLayout: currentSelection?.recordLayout || 'vault',
       repository: { root: observation.root, branch: observation.branch, head: observation.head, dirty: observation.dirty },
       vaultSelection,
       lastRecordedVaultSelection: null,
@@ -772,7 +997,7 @@ function recoveryCard(bundle, observation, paths, currentSelection) {
       blockers: [],
       next: { objective: 'Register the repository and record the current task.', allowed: [], prohibited: ['Business-file writes before run adoption.'] },
       references: { vault: paths.vault, context: paths.context }
-    }
+    })
   }
   const activeRuns = bundle.state.activeRuns.slice(-3).map((entry) => {
     const found = findRun(paths, entry.runId)
@@ -787,11 +1012,12 @@ function recoveryCard(bundle, observation, paths, currentSelection) {
       lease: integrityProblems.length === 0 ? runLeaseStatus(found.run) : { status: 'invalid', reason: 'Run integrity is not trustworthy.' }
     }
   })
-  return safeProjection({
+  return finalizeRecoveryCard({
     trust,
     vaultSelection,
     lastRecordedVaultSelection: bundle.state.vaultSelection || null,
     repository: {
+      projectId: bundle.state.repo.projectId || observation.repoId,
       repoId: observation.repoId,
       workspaceId: observation.workspaceId,
       contextId: observation.contextId,
@@ -803,6 +1029,7 @@ function recoveryCard(bundle, observation, paths, currentSelection) {
       dirtyFileCount: observation.statusLines.length,
       statusFingerprint: observation.statusFingerprint
     },
+    recordLayout: bundle.state.recordLayout || 'vault',
     task: boundedTask(bundle.state.task),
     requirement: boundedTask(bundle.state.task)?.requirement || null,
     progress: boundedRecords(bundle.state.claims.filter((claim) => claim.taskId === bundle.state.task?.id), 6),
@@ -810,7 +1037,13 @@ function recoveryCard(bundle, observation, paths, currentSelection) {
     confirmedFacts: boundedRecords(bundle.state.confirmedFacts.filter((item) => item.taskId === bundle.state.task?.id && item.status !== 'stale'), 8),
     hypotheses: boundedRecords(bundle.state.hypotheses.filter((item) => item.taskId === bundle.state.task?.id && !['rejected'].includes(item.status)), 8),
     activeRuns,
-    abandonedRuns: (bundle.state.abandonedRuns || []).slice(-3),
+    abandonedRuns: (bundle.state.abandonedRuns || []).slice(-3).map((item) => ({
+      runId: item.runId || null,
+      status: safeSummary(item.status, 80),
+      supersededByRunId: item.supersededByRunId || null,
+      observedAt: item.observedAt || null,
+      reason: safeSummary(item.reason, 180)
+    })),
     lastRun: bundle.state.lastRun ? {
       runId: bundle.state.lastRun.runId || null,
       status: bundle.state.lastRun.status || null,
@@ -824,8 +1057,20 @@ function recoveryCard(bundle, observation, paths, currentSelection) {
       allowed: (bundle.state.task?.allowedActions || []).slice(0, 10).map((item) => safeSummary(item, 100)),
       prohibited: (bundle.state.task?.prohibitedActions || []).slice(0, 10).map((item) => safeSummary(item, 100))
     },
-    map: bundle.state.map,
-    capture: bundle.state.capture,
+    map: bundle.state.map ? {
+      versionId: bundle.state.map.versionId,
+      head: bundle.state.map.head,
+      statusFingerprint: bundle.state.map.statusFingerprint,
+      trackedFiles: bundle.state.map.trackedFiles,
+      sourceFilesInspected: bundle.state.map.sourceFilesInspected,
+      manifest: bundle.state.map.manifest,
+      pointer: bundle.state.map.pointer
+    } : null,
+    capture: {
+      mode: safeSummary(bundle.state.capture?.mode, 120),
+      coverage: safeSummary(bundle.state.capture?.coverage, 160),
+      warning: safeSummary(bundle.state.capture?.warning, 260)
+    },
     references: {
       machineState: bundle.generationFile,
       projectContext: paths.projectContext,
@@ -833,6 +1078,7 @@ function recoveryCard(bundle, observation, paths, currentSelection) {
       fileIndex: paths.fileIndex,
       vault: paths.vault
     },
+    stateHash: bundle.pointer.sha256,
     stateBindingHash: routeToken(bundle, observation, activeRuns[0]?.runId || null)
   })
 }
@@ -851,7 +1097,7 @@ function textCard(card) {
   const full = `# Recovery Card
 
 Trust: ${card.trust.status}${card.trust.reasons.length ? ` — ${card.trust.reasons.join(' ')}` : ''}
-Vault: ${card.vaultSelection?.path || card.references?.vault || 'not recorded'} (${card.vaultSelection?.currentSessionDeclarationRecorded ? `current-session user-selection declaration recorded at ${card.vaultSelection.declarationRecordedAt || 'unknown time'}` : 'current-session declaration not recorded'})
+Context store: ${card.vaultSelection?.path || card.references?.vault || 'not recorded'}; layout ${card.recordLayout || card.vaultSelection?.recordLayout || 'not recorded'} (${card.vaultSelection?.currentSessionDeclarationRecorded ? `current-session user-selection declaration recorded at ${card.vaultSelection.declarationRecordedAt || 'unknown time'}` : 'current-session declaration not recorded'})
 
 1. Repository / branch / HEAD
    - ${card.repository.root}
@@ -884,11 +1130,12 @@ Open runs
 ${active}
 
 References
-- Vault: ${card.references.vault || card.vaultSelection?.path || 'not recorded'}
+- Context store: ${card.references.vault || card.vaultSelection?.path || 'not recorded'} (${card.recordLayout || card.vaultSelection?.recordLayout || 'not recorded'})
 - Machine state: ${card.references.machineState || 'not created'}
 - Project context: ${card.references.projectContext || 'not created'}
 - Architecture: ${card.references.architecture || 'not created'}
 - File index: ${card.references.fileIndex || 'not created'}
+- State hash (relink selector): ${card.stateHash || 'not available'}
 - State binding hash: ${card.stateBindingHash || 'not available'}
 `
   const cjk = (full.match(/[\u3400-\u9fff\uf900-\ufaff]/g) || []).length
@@ -897,14 +1144,14 @@ References
   if (estimatedTokens <= 1150) return full
   return `# Recovery Card (bounded)
 Trust: ${card.trust.status} — ${safeSummary(card.trust.reasons.join(' '), 180)}
-Vault: ${card.vaultSelection?.path || card.references?.vault || 'not recorded'} | current-session declaration ${card.vaultSelection?.currentSessionDeclarationRecorded ? 'recorded' : 'not recorded'}
+Context store: ${card.vaultSelection?.path || card.references?.vault || 'not recorded'} | layout ${card.recordLayout || card.vaultSelection?.recordLayout || 'not recorded'} | current-session declaration ${card.vaultSelection?.currentSessionDeclarationRecorded ? 'recorded' : 'not recorded'}
 1. Repo: ${card.repository.root} | ${card.repository.branch || 'DETACHED'} @ ${card.repository.head} | dirty ${card.repository.dirty ? 'yes' : 'no'}
 2. Task: ${task ? `${task.id}: ${safeSummary(task.title, 120)}` : 'not recorded'}
 3. Requirement: ${safeSummary(card.requirement || task?.reason || 'Not recorded.', 180)} | PRD ${task?.prd?.sha256 || 'not recorded'} (${task?.prd?.approval || 'not recorded'})
 4. Progress: ${(card.progress || []).slice(-3).map((claim) => `${claim.type}:${claim.status}[${safeSummary(claim.scope || claim.statement || '', 90)}]`).join('; ') || 'none'}
 5. Next: ${safeSummary(card.next?.objective || 'Not recorded.', 160)} | prohibited ${safeSummary(card.next?.prohibited?.join(', ') || 'not enumerated', 140)}
 Blockers: ${(card.blockers || []).slice(-3).map((item) => safeSummary(item.statement || item, 100)).join('; ') || 'none'}
-Refs: state ${card.references.machineState || 'none'} | context ${card.references.projectContext || 'none'} | binding ${card.stateBindingHash || 'none'}
+Refs: state ${card.references.machineState || 'none'} | context ${card.references.projectContext || 'none'} | stateHash ${card.stateHash || 'none'} | binding ${card.stateBindingHash || 'none'}
 `
 }
 
@@ -929,7 +1176,8 @@ function resolveEvidenceReference(paths, observation, runId, reference) {
   }
   const evidenceMetadata = path.join(paths.evidence, runId, text, 'evidence.json')
   if (isWithin(evidenceMetadata, path.join(paths.evidence, runId)) && existsSync(evidenceMetadata)) {
-    const record = readJson(evidenceMetadata)
+    secureVaultDirectory(paths, path.dirname(evidenceMetadata))
+    const record = JSON.parse(readSecureVaultFile(paths, evidenceMetadata))
     if (validateEvidenceRecord(paths, runId, evidenceMetadata, record).length === 0) return { kind: 'evidence', path: evidenceMetadata, record }
     return null
   }
@@ -937,9 +1185,10 @@ function resolveEvidenceReference(paths, observation, runId, reference) {
   if (!found || !existsSync(found.eventDir)) return null
   const runIntegrity = verifyRunView(paths, runId)
   if (!runIntegrity.runRecordValid || !runIntegrity.hashChainValid || !runIntegrity.sequencesValid) return null
+  secureVaultDirectory(paths, found.eventDir)
   for (const name of readdirSync(found.eventDir).filter((entry) => entry.endsWith('.json'))) {
     try {
-      const record = readJson(path.join(found.eventDir, name))
+      const record = JSON.parse(readSecureVaultFile(paths, path.join(found.eventDir, name)))
       if (record.eventId === text) return { kind: 'event', path: path.join(found.eventDir, name), record }
     } catch {
       // A corrupt event is not usable as evidence; verify reports the corruption separately.
@@ -999,12 +1248,14 @@ function sealedEvidenceProblems(paths, observation, runId, evidence, bindings, l
         problems.push(`${label} evidence-capture event ${resolved.record.eventId} is missing ${evidenceId}.`)
       } else {
         try {
-          const record = readJson(metadataPath)
+          secureVaultDirectory(paths, path.dirname(metadataPath))
+          const record = JSON.parse(readSecureVaultFile(paths, metadataPath))
           const recordProblems = validateEvidenceRecord(paths, resolved.record.runId, metadataPath, record)
           if (recordProblems.length > 0 || resolved.record.metadata.evidenceRecordHash !== sha256(stableJson(record)) || resolved.record.metadata.storedSha256 !== record.sha256) {
             problems.push(`${label} evidence-capture event ${resolved.record.eventId} has a corrupt typed evidence binding.`)
           }
-        } catch {
+        } catch (error) {
+          if (error.code === 'VAULT_PATH_UNSAFE') throw error
           problems.push(`${label} evidence-capture event ${resolved.record.eventId} cannot be validated.`)
         }
       }
@@ -1044,6 +1295,7 @@ function validateEvidenceRecord(paths, runId, metadataPath, record) {
   const errors = []
   const evidenceId = path.basename(path.dirname(metadataPath))
   const evidenceRoot = path.join(paths.evidence, runId, evidenceId)
+  secureVaultDirectory(paths, evidenceRoot)
   if (record?.protocol !== 'project-context/evidence/v1') errors.push('unsupported evidence protocol')
   if (record?.runId !== runId || record?.evidenceId !== evidenceId) errors.push('evidence identity mismatch')
   if (!EVIDENCE_KINDS.has(record?.kind || 'attachment')) errors.push('invalid evidence kind')
@@ -1069,9 +1321,10 @@ function validateEvidenceRecord(paths, runId, metadataPath, record) {
   if (found && existsSync(found.eventDir)) {
     const runIntegrity = verifyRunView(paths, runId)
     if (!runIntegrity.runRecordValid || !runIntegrity.hashChainValid || !runIntegrity.sequencesValid) errors.push('evidence attestation run is corrupt')
+    secureVaultDirectory(paths, found.eventDir)
     for (const name of readdirSync(found.eventDir).filter((entry) => /^\d{6}\.json$/.test(entry))) {
       try {
-        const event = readJson(path.join(found.eventDir, name))
+        const event = JSON.parse(readSecureVaultFile(paths, path.join(found.eventDir, name)))
         if (event.metadata?.evidenceId === evidenceId && event.metadata?.evidenceRecordHash === sha256(stableJson(record)) && event.metadata?.storedSha256 === record.sha256) {
           attested = true
           break
@@ -1249,7 +1502,7 @@ function activeRunEntry(paths, run) {
 export function registerCommand(args) {
   requireUserConfirmedVault(args, 'register')
   const current = observe(args)
-  const vaultSelection = vaultSelectionRecord(current.paths.vault, 'register')
+  let vaultSelection = vaultSelectionRecord(current.paths.vault, 'register', current.recordLayout)
   const vaultInitialized = existsSync(current.paths.registry) || existsSync(current.paths.repositoryMetadata) || existsSync(current.paths.currentPointer)
   if (!vaultInitialized) {
     const preliminaryTask = taskRecord(args, null)
@@ -1259,6 +1512,8 @@ export function registerCommand(args) {
   return withStateLock(current.paths, () => {
     let bundle = loadState(current.paths)
     if (bundle) {
+      vaultSelection = vaultSelectionRecord(current.paths.vault, 'register', bundle.state.recordLayout || current.recordLayout)
+      assertRecordLayout(bundle, args)
       assertIdentity(bundle, current.observation)
       const runId = required(args, 'run', 'Refreshing an existing registration requires --run from the current session')
       assert(bundle.state.activeRuns.some((item) => item.runId === runId), `Run ${runId} is not active in this context`, 'RUN_NOT_ACTIVE_IN_CONTEXT')
@@ -1267,7 +1522,7 @@ export function registerCommand(args) {
     }
     const task = taskRecord(args, bundle?.state.task || null)
     if (task) assertApprovedPrd(task)
-    let state = bundle?.state || initialState(current.observation, {})
+    let state = bundle?.state || initialState(current.observation, { recordLayout: current.recordLayout })
     const liveChanges = bundle ? liveObservationChanges(state, current.observation) : []
     assert(liveChanges.length === 0, `Registration cannot absorb live ${liveChanges.join(', ')} changes; begin a run and checkpoint or explicitly reconcile them there`, 'LIVE_CHANGE_RECONCILIATION_REQUIRED')
     const taskChanged = Boolean(state.task && task && (state.task.id !== task.id || state.task.title !== task.title))
@@ -1291,6 +1546,7 @@ export function registerCommand(args) {
       },
       observation: compactObservation(current.observation),
       vaultSelection,
+      recordLayout: bundle?.state.recordLayout || current.recordLayout,
       task,
       stage: 'registered',
       taskHistory,
@@ -1299,6 +1555,7 @@ export function registerCommand(args) {
     }
     const manifest = generateProjectMap(current.paths, current.observation)
     state.map = mapReference(manifest, current.paths)
+    state.profile = projectProfile(args, state.profile, manifest, current.observation)
     bundle = writeState(current.paths, bundle, state)
     return { command: 'register', state: safeStateSummary(bundle), pointer: bundle.pointer, map: state.map, recovery: recoveryCard(bundle, current.observation, current.paths, vaultSelection) }
   })
@@ -1307,7 +1564,7 @@ export function registerCommand(args) {
 export function beginCommand(args) {
   requireUserConfirmedVault(args, 'begin')
   const current = observe(args)
-  const vaultSelection = vaultSelectionRecord(current.paths.vault, 'begin')
+  let vaultSelection = vaultSelectionRecord(current.paths.vault, 'begin', current.recordLayout)
   const leaseSeconds = validatedLeaseSeconds(args)
   const vaultInitialized = existsSync(current.paths.registry) || existsSync(current.paths.repositoryMetadata) || existsSync(current.paths.currentPointer)
   if (!vaultInitialized) {
@@ -1326,9 +1583,11 @@ export function beginCommand(args) {
   return withStateLock(current.paths, () => {
     let bundle = loadState(current.paths)
     if (!bundle) {
-      const unmanaged = initialState(current.observation, {})
+      const unmanaged = initialState(current.observation, { recordLayout: current.recordLayout })
       bundle = writeState(current.paths, null, unmanaged)
     }
+    vaultSelection = vaultSelectionRecord(current.paths.vault, 'begin', bundle.state.recordLayout || current.recordLayout)
+    assertRecordLayout(bundle, args)
     assertIdentity(bundle, current.observation)
     assertActiveRunsIntegrity(current.paths, bundle.state)
     const recordedPrd = bundle.state.task?.prd || null
@@ -1522,7 +1781,7 @@ export function beginCommand(args) {
         taskAuthorizationEventId || externalChangeEventId,
         taskUpdated
       )
-      const state = {
+      let state = {
         ...bundle.state,
         task,
         stage: 'active-run',
@@ -1562,6 +1821,14 @@ export function beginCommand(args) {
         repo: { ...bundle.state.repo, branch: current.observation.branch, detached: current.observation.detached },
         observation: created.run.startObservation,
         vaultSelection: created.run.vaultSelection,
+        recordLayout: bundle.state.recordLayout || current.recordLayout,
+        capture: {
+          mode: args.harness && args.harness !== true ? String(args.harness) : 'manual-cli',
+          coverage: args.coverage && args.coverage !== true ? String(args.coverage) : 'observed-and-agent-reported',
+          warning: args.coverage === 'mediated-supported-lifecycle-events'
+            ? 'Coverage is limited to lifecycle callbacks actually invoked by the trusted Harness integration.'
+            : 'Only mediated or explicitly reported operations are captured in real time.'
+        },
         trust: unresolvedBlockers ? { status: 'BLOCKED', reasons: ['One or more recorded blockers remain open.'] } : preservePriorTrust ? bundle.state.trust : { status: 'READY', reasons: [] },
         activeRuns: [...bundle.state.activeRuns.filter((item) => item.runId !== runId && item.runId !== recoveredFromRunId), activeRunEntry(current.paths, created.run)],
         authorityHistory: created.run.authorityRecord ? [...bundle.state.authorityHistory, {
@@ -1572,6 +1839,12 @@ export function beginCommand(args) {
           historicalOnly: true
         }] : bundle.state.authorityHistory,
         nextObjective: args.next && args.next !== true ? String(args.next) : bundle.state.nextObjective || task.objective
+      }
+      if (!state.map) {
+        const manifest = generateProjectMap(current.paths, current.observation)
+        state = { ...state, map: mapReference(manifest, current.paths), profile: projectProfile(args, state.profile, manifest, current.observation) }
+      } else if (!state.profile) {
+        state = { ...state, profile: projectProfile(args, null, loadMapManifest(state, current.paths), current.observation) }
       }
       bundle = writeState(current.paths, bundle, state)
     } catch (error) {
@@ -1604,11 +1877,13 @@ export function beginCommand(args) {
 export function resumeCommand(args) {
   requireUserConfirmedVault(args, 'resume')
   const current = observe(args)
-  const vaultSelection = vaultSelectionRecord(current.paths.vault, 'resume')
   validateVaultLocation(current.vault, current.observation)
   const bundle = loadState(current.paths)
+  assertRecordLayout(bundle, args)
+  const vaultSelection = vaultSelectionRecord(current.paths.vault, 'resume', bundle?.state.recordLayout || current.recordLayout)
   const card = recoveryCard(bundle, current.observation, current.paths, vaultSelection)
-  return { command: 'resume', card, text: textCard(card), exitCode: ['READY', 'UNMANAGED'].includes(card.trust.status) ? 0 : 3 }
+  const result = { command: 'resume', card, exitCode: ['READY', 'UNMANAGED'].includes(card.trust.status) ? 0 : 3 }
+  return args.json ? result : { ...result, text: textCard(card) }
 }
 
 export function routeCommand(args) {
@@ -1617,7 +1892,7 @@ export function routeCommand(args) {
   assert(bundle, 'Repository is not registered', 'STATE_UNMANAGED')
   assertIdentity(bundle, current.observation)
   const authority = args.authority && args.authority !== true ? String(args.authority) : null
-  const signals = splitList(required(args, 'event', '--event is required so routing can be recomputed deterministically'))
+  const signals = validatedRouteSignals(splitList(required(args, 'event', '--event is required so routing can be recomputed deterministically')))
   const key = protocolKey(current.paths)
   const keyId = sha256(key).slice(0, 16)
   const sensitivePreflight = signals.some((signal) => ['commit', 'push'].includes(String(signal).toLowerCase()))
@@ -1631,40 +1906,42 @@ export function routeCommand(args) {
     const trust = classifyTrust(bundle, current.observation, current.paths)
     const selected = selectMode(trust, bundle.state, signals, supplied.activeRunId)
     const highRisk = selected.mode === 'release-with-provenance'
-    const approval = highRisk ? externalApprovalStatus(current.paths, bundle, current.observation, run, signals, authority, args) : { valid: true }
-    const approvalBinding = approval.valid && highRisk ? {
-      approvalId: approval.approvalId,
-      providerFingerprint: approval.providerFingerprint,
-      providerKeyId: approval.providerKeyId,
-      capabilityHash: approval.capabilityHash,
-      operationScope: approval.operationScope,
-      environment: approval.environment,
-      expiresAt: approval.expiresAt
-    } : null
-    const expected = credentialPayload(bundle, current.observation, selected.mode, signals, authority, supplied.activeRunId, run?.sessionNonceHash || null, currentAuthority, keyId, approvalBinding)
+    const approval = highRisk ? externalApprovalStatus() : { requiredByProtocol: false }
+    const expected = credentialPayload(bundle, current.observation, selected.mode, signals, authority, supplied.activeRunId, run?.sessionNonceHash || null, currentAuthority, keyId, null)
     const mismatches = credentialMismatches(expected, supplied)
     if (!supplied.issuedAt || !Number.isFinite(Date.parse(supplied.issuedAt)) || Date.parse(supplied.issuedAt) > Date.now() + 60_000) mismatches.push('issuedAt')
     if (!supplied.expiresAt || !Number.isFinite(Date.parse(supplied.expiresAt)) || Date.parse(supplied.expiresAt) < Date.now()) mismatches.push('expiresAt')
     const activeExists = supplied.activeRunId ? bundle.state.activeRuns.some((item) => item.runId === supplied.activeRunId) : true
     if (!activeExists) mismatches.push('activeRunId')
-    if (trust.status !== 'READY') mismatches.push('trustStatus')
-    if (sensitivePreflight.length > 0) mismatches.push('sensitiveGitPreflight')
-    if (supplied.mode === 'release-with-provenance' && (!authority || !currentAuthority)) mismatches.push('currentAuthority')
-    if (highRisk && !approval.valid) mismatches.push('externalApproval')
-    const authorized = !highRisk
-    const valid = mismatches.length === 0 && authorized && trust.status === 'READY' && sensitivePreflight.length === 0
+    const valid = mismatches.length === 0
+    const readinessBlockers = []
+    if (trust.status !== 'READY') readinessBlockers.push('trustStatus')
+    if (!supplied.activeRunId || !activeExists) readinessBlockers.push('activeRunId')
+    if (sensitivePreflight.length > 0) readinessBlockers.push('sensitiveGitPreflight')
+    if (highRisk && (!authority || !currentAuthority)) readinessBlockers.push('currentAuthority')
+    const recordingReady = valid && readinessBlockers.length === 0
+    const executable = !highRisk && recordingReady
+    const exitCode = !valid ? 4
+      : trust.status !== 'READY' ? 3
+        : !supplied.activeRunId || !activeExists ? 6
+          : readinessBlockers.length > 0 ? 5
+            : 0
     return {
       command: 'route',
       action: 'validate',
       valid,
-      executable: !highRisk && valid && Boolean(supplied.activeRunId),
+      executable,
+      recordingReady,
+      readinessBlockers: unique(readinessBlockers),
+      protocolExecutesAction: false,
+      executionAuthority: 'external-to-protocol',
       mode: selected.mode,
       trust,
       mismatches: unique(mismatches),
       sensitiveGitPreflight: { passed: sensitivePreflight.length === 0, violations: sensitivePreflight },
-      externalApproval: highRisk ? { valid: approval.valid, reason: approval.valid ? null : approval.reason, providerKeyId: approval.providerKeyId || null } : { required: false },
-      warning: 'Standalone v1 never makes a high-risk route executable; the route HMAC is only a staleness binding and Agent-reported authority is historical data.',
-      exitCode: valid && supplied.activeRunId ? 0 : valid ? 6 : 4
+      externalApproval: approval,
+      warning: 'The protocol does not authorize or execute host actions. Current user/platform authority governs the action; this route only binds context and records readiness/provenance.',
+      exitCode
     }
   }
   const trust = classifyTrust(bundle, current.observation, current.paths)
@@ -1677,19 +1954,19 @@ export function routeCommand(args) {
   const selected = selectMode(trust, bundle.state, signals, activeRunId)
   const currentAuthority = Boolean(args['current-session-authority'])
   const highRisk = selected.mode === 'release-with-provenance'
-  const approval = highRisk ? externalApprovalStatus(current.paths, bundle, current.observation, run, signals, authority, args) : { valid: true }
-  const approvalBinding = approval.valid && highRisk ? {
-    approvalId: approval.approvalId,
-    providerFingerprint: approval.providerFingerprint,
-    providerKeyId: approval.providerKeyId,
-    capabilityHash: approval.capabilityHash,
-    operationScope: approval.operationScope,
-    environment: approval.environment,
-    expiresAt: approval.expiresAt
-  } : null
-  const payload = credentialPayload(bundle, current.observation, selected.mode, signals, authority, activeRunId, run?.sessionNonceHash || null, currentAuthority, keyId, approvalBinding)
-  const authorized = !highRisk
-  const executable = !highRisk && authorized && trust.status === 'READY' && Boolean(activeRunId) && sensitivePreflight.length === 0
+  const approval = highRisk ? externalApprovalStatus() : { requiredByProtocol: false }
+  const payload = credentialPayload(bundle, current.observation, selected.mode, signals, authority, activeRunId, run?.sessionNonceHash || null, currentAuthority, keyId, null)
+  const readinessBlockers = []
+  if (trust.status !== 'READY') readinessBlockers.push('trustStatus')
+  if (!activeRunId) readinessBlockers.push('activeRunId')
+  if (sensitivePreflight.length > 0) readinessBlockers.push('sensitiveGitPreflight')
+  if (highRisk && (!authority || !currentAuthority)) readinessBlockers.push('currentAuthority')
+  const recordingReady = readinessBlockers.length === 0
+  const executable = !highRisk && recordingReady
+  const exitCode = trust.status !== 'READY' ? 3
+    : !activeRunId ? 6
+      : readinessBlockers.length > 0 ? 5
+        : 0
   return {
     command: 'route',
     mode: selected.mode,
@@ -1701,13 +1978,17 @@ export function routeCommand(args) {
     credentialBindings: payload,
     sensitiveGitPreflight: { passed: sensitivePreflight.length === 0, violations: sensitivePreflight },
     executable,
+    recordingReady,
+    readinessBlockers: unique(readinessBlockers),
+    protocolExecutesAction: false,
+    executionAuthority: 'external-to-protocol',
     authority: highRisk ? {
-      status: authorized ? 'trusted-host-approval-verified' : 'standalone-high-risk-execution-disabled',
+      status: recordingReady ? 'current-session-authority-bound-host-action-external' : 'current-session-authority-required',
       historicalRecordsGrantAuthority: false
     } : { status: 'not-required-for-route', historicalRecordsGrantAuthority: false },
-    externalApproval: highRisk ? { valid: approval.valid, reason: approval.valid ? null : approval.reason, providerKeyId: approval.providerKeyId || null } : { required: false },
-    warning: 'Standalone v1 never makes a high-risk route executable; the route HMAC is only a staleness binding and Agent-reported authority is historical data.',
-    exitCode: executable ? 0 : highRisk && !authorized ? 5 : trust.status !== 'READY' ? 3 : 6
+    externalApproval: approval,
+    warning: 'The protocol does not authorize or execute host actions. Current user/platform authority governs the action; this route only binds context and records readiness/provenance.',
+    exitCode
   }
 }
 
@@ -1730,7 +2011,7 @@ export function checkpointCommand(args) {
           ? String(args['event-type'])
           : required(args, 'route-event', '--route-event is required when a route token is supplied')
       const validation = routeCommand({ ...args, event: routeEvent, validate: String(args['route-token']) })
-      assert(validation.valid && validation.executable, 'Route token is stale, non-executable, or bound to another route/context', 'ROUTE_TOKEN_STALE')
+      assert(validation.valid && validation.recordingReady, 'Route token is stale, not recording-ready, or bound to another route/context', 'ROUTE_TOKEN_STALE')
     }
     const evidence = splitList(args.evidence)
     let eventEvidenceBindings = null
@@ -2060,6 +2341,7 @@ export function mapCommand(args) {
       stage: 'map',
       observation: compactObservation(current.observation),
       map: mapReference(manifest, current.paths),
+      profile: projectProfile(args, bundle.state.profile, manifest, current.observation),
       trust: { status: 'READY', reasons: [] }
     }
     appendRunEvent(current.paths, runId, {
@@ -2073,13 +2355,678 @@ export function mapCommand(args) {
   })
 }
 
-function refreshEvidenceManifest(runEvidenceDir) {
+function profileOutput(bundle, paths) {
+  const layout = bundle.state.recordLayout || 'vault'
+  const humanRoot = layout === 'markdown' ? paths.markdownContext : layout === 'hybrid' ? paths.portableContext : paths.context
+  const source = bundle.state.profile || {}
+  const profile = safeProjection({
+    name: safeSummary(source.name, 140),
+    summary: safeSummary(source.summary, 480),
+    purpose: safeSummary(source.purpose, 480),
+    audience: safeSummary(source.audience, 240),
+    repositoryRole: safeSummary(source.repositoryRole, 220),
+    components: (source.components || []).slice(0, 12).map((item) => typeof item === 'string'
+      ? safeSummary(item, 220)
+      : { path: safeSummary(item?.path, 140), role: safeSummary(item?.role, 180), files: Number.isInteger(item?.files) ? item.files : null }),
+    keyCommands: (source.keyCommands || []).slice(0, 12).map((item) => typeof item === 'string'
+      ? safeSummary(item, 220)
+      : { name: safeSummary(item?.name, 100), command: safeSummary(item?.command, 220), manifest: safeSummary(item?.manifest, 160) }),
+    boundaries: (source.boundaries || []).slice(0, 12).map((item) => safeSummary(item, 260)),
+    risks: (source.risks || []).slice(0, 12).map((item) => safeSummary(item, 260)),
+    source: safeSummary(source.source, 260),
+    userConfirmed: Boolean(source.userConfirmed),
+    mapVersion: source.mapVersion || null,
+    updatedAt: source.updatedAt || null
+  })
+  const profileBytes = Buffer.byteLength(stableJson(profile, 0), 'utf8')
+  assert(profileBytes <= 12 * 1024, 'Bounded profile JSON exceeded its hard byte budget', 'PROJECT_PROFILE_BUDGET_EXCEEDED')
+  return {
+    projectId: bundle.state.repo.projectId || bundle.state.repo.repoId,
+    recordLayout: layout,
+    profile,
+    profileBudget: { maximumBytes: 12 * 1024, actualBytes: profileBytes },
+    profileMarkdown: path.join(humanRoot, 'PROJECT_PROFILE.md'),
+    machineState: bundle.generationFile,
+    stateHash: bundle.pointer.sha256
+  }
+}
+
+export function profileCommand(args) {
+  requireUserConfirmedVault(args, 'profile')
+  const current = observe(args)
+  const save = Boolean(args.save)
+  if (!save) {
+    const bundle = loadState(current.paths)
+    assert(bundle, 'Repository is not registered', 'STATE_UNMANAGED')
+    assertIdentity(bundle, current.observation)
+    assertRecordLayout(bundle, args)
+    return { command: 'profile', saved: false, ...profileOutput(bundle, current.paths) }
+  }
+  const runId = required(args, 'run', 'Saving a project profile requires --run from the current session')
+  return withStateLock(current.paths, () => {
+    let bundle = loadState(current.paths)
+    assert(bundle, 'Repository is not registered', 'STATE_UNMANAGED')
+    assertIdentity(bundle, current.observation)
+    assertRecordLayout(bundle, args)
+    assert(bundle.state.activeRuns.some((item) => item.runId === runId), `Run ${runId} is not active in this context`, 'RUN_NOT_ACTIVE_IN_CONTEXT')
+    validateRunSession(current.paths, runId, args)
+    const manifest = loadMapManifest(bundle.state, current.paths)
+    const state = { ...bundle.state, profile: projectProfile(args, bundle.state.profile, manifest, current.observation) }
+    appendRunEvent(current.paths, runId, {
+      type: 'observation',
+      summary: 'Refreshed the durable project profile.',
+      details: 'Profile fields remain descriptive context and do not alter the PRD or grant authorization.',
+      evidence: manifest ? [bundle.state.map.manifest] : [],
+      source: 'project-profile'
+    })
+    bundle = writeState(current.paths, bundle, state)
+    return { command: 'profile', saved: true, ...profileOutput(bundle, current.paths) }
+  })
+}
+
+function dateInTimeZone(iso, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(iso))
+  const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]))
+  return `${values.year}-${values.month}-${values.day}`
+}
+
+function renderDailySummary(summary) {
+  const runs = summary.runs.map((run) => `| \`${tableMarkdown(run.runId)}\` | ${tableMarkdown(run.status)} | ${tableMarkdown(run.startedAt || '—')} | ${tableMarkdown(run.summary || '—')} |`).join('\n') || '| — | — | — | No runs recorded for this date. |'
+  const events = summary.events.map((event) => `- **${inlineMarkdown(event.type)}** ${inlineMarkdown(event.observedAt)}: ${inlineMarkdown(event.summary)}${event.files.length ? ` (files: ${event.files.map((item) => inlineMarkdown(item)).join(', ')})` : ''}`).join('\n') || '- No immutable run events recorded for this date.'
+  const layers = summary.layers.map((item) => `| ${tableMarkdown(item.type)} | ${tableMarkdown(item.status)} | ${tableMarkdown(item.scope || '—')} | ${item.evidenceCount} |`).join('\n') || '| — | — | — | 0 |'
+  return `# Development Daily Summary — ${summary.date}
+
+> User-triggered derived view for timezone \`${inlineMarkdown(summary.timeZone)}\`. Immutable run/event JSON and the referenced state generation remain authoritative. No deployment, acceptance, or completion layer is inferred.
+
+## Project and revision
+
+- Project ID: \`${inlineMarkdown(summary.projectId)}\`
+- Repository: \`${inlineMarkdown(summary.repository.root)}\`
+- Branch / HEAD: \`${inlineMarkdown(summary.repository.branch || 'DETACHED')}\` / \`${inlineMarkdown(summary.repository.head)}\`
+- State generation: ${summary.stateGeneration} / \`${summary.stateHash}\`
+- Current task: ${summary.task ? `\`${inlineMarkdown(summary.task.id)}\` — ${inlineMarkdown(summary.task.title)}` : 'Not recorded.'}
+
+## Runs
+
+- Page ${summary.runPage.page}/${summary.runPage.totalPages}; showing ${summary.runs.length} of ${summary.runPage.totalRuns} runs.
+
+| Run | Status | Started | Recorded summary |
+|---|---|---|---|
+${runs}
+
+## Recorded development events
+
+- Page ${summary.eventPage.page}/${summary.eventPage.totalPages}; showing ${summary.events.length} of ${summary.eventPage.totalEvents} events. Combined artifact page ${summary.pagination.page}/${summary.pagination.totalPages}.
+
+${events}
+
+## Independent progress layers
+
+| Layer | Status | Scope | Evidence refs |
+|---|---|---|---:|
+${layers}
+
+## Blockers, pitfalls, and next boundary
+
+- Open blockers: ${inlineMarkdown(summary.blockers.join('; ') || 'none recorded')}
+- Pitfalls: ${inlineMarkdown(summary.pitfalls.join('; ') || 'none recorded')}
+- Next objective: ${inlineMarkdown(summary.nextObjective || 'not recorded')}
+- Coverage: ${inlineMarkdown(summary.capture.coverage || 'not recorded')}; ${inlineMarkdown(summary.capture.warning || '')}
+`
+}
+
+function dailySnapshotHash(snapshot) {
+  const body = { ...snapshot }
+  delete body.snapshotHash
+  return sha256(stableJson(body, 0))
+}
+
+function readDailySnapshot(file, paths = null) {
+  let snapshot
+  try {
+    const raw = paths ? readSecureVaultFile(paths, file) : readFileSync(file, 'utf8')
+    assert(raw !== null, 'Saved daily snapshot is missing', 'DAILY_SNAPSHOT_INVALID')
+    snapshot = JSON.parse(raw)
+  } catch (error) {
+    if (['DAILY_SNAPSHOT_INVALID', 'VAULT_PATH_UNSAFE'].includes(error.code)) throw error
+    assert(false, `Saved daily snapshot is unreadable (${error.code || 'INVALID_JSON'})`, 'DAILY_SNAPSHOT_INVALID')
+  }
+  assert(snapshot.protocol === 'project-context/daily-snapshot/v2', 'Saved daily snapshot protocol is invalid', 'DAILY_SNAPSHOT_INVALID')
+  assert(snapshot.snapshotHash === dailySnapshotHash(snapshot), 'Saved daily snapshot hash is invalid', 'DAILY_SNAPSHOT_CORRUPT')
+  assert(Array.isArray(snapshot.events) && Array.isArray(snapshot.runs), 'Saved daily snapshot is incomplete', 'DAILY_SNAPSHOT_INVALID')
+  assert(Number.isInteger(snapshot.pageSize) && snapshot.pageSize >= 1 && snapshot.pageSize <= 10, 'Saved daily snapshot page size is invalid', 'DAILY_SNAPSHOT_INVALID')
+  return snapshot
+}
+
+function buildDailySnapshot(current, bundle, date, timeZone, pageSize) {
+  const runs = []
+  const events = []
+  const maximumEvents = 10_000
+  const maximumRuns = 500
+  for (const item of listRuns(current.paths)) {
+    const verification = verifyRunView(current.paths, item.run.runId)
+    assert(verification.runRecordValid && verification.hashChainValid && verification.sequencesValid, `Run ${item.run.runId} cannot be used in a daily summary because its immutable record chain is invalid`, 'DAILY_SOURCE_INTEGRITY_FAILED')
+    const runEvents = readRunEvents(current.paths, item.run.runId)
+    const selectedEvents = runEvents.filter((event) => dateInTimeZone(event.observedAt, timeZone) === date)
+    const runTouchesDate = selectedEvents.length > 0 || [item.run.startedAt, item.run.endedAt].filter(Boolean).some((value) => dateInTimeZone(value, timeZone) === date)
+    if (!runTouchesDate) continue
+    runs.push({
+      runId: item.run.runId,
+      status: item.run.status,
+      startedAt: item.run.startedAt,
+      endedAt: item.run.endedAt || null,
+      summary: safeSummary(item.run.summary, 220)
+    })
+    assert(runs.length <= maximumRuns, `Daily summary exceeded its ${maximumRuns}-run scan budget; split or archive the selected date explicitly`, 'DAILY_SCAN_BUDGET_EXCEEDED')
+    for (const event of selectedEvents) {
+      events.push({
+        eventId: event.eventId,
+        runId: event.runId,
+        type: event.type,
+        observedAt: event.observedAt,
+        summary: safeSummary(event.summary, 260),
+        files: (event.files || []).slice(0, 12).map((file) => safeSummary(file, 120)),
+        evidence: (event.evidence || []).slice(0, 8).map((value) => safeSummary(value, 120))
+      })
+      assert(events.length <= maximumEvents, `Daily summary exceeded its ${maximumEvents}-event scan budget; no events were silently omitted`, 'DAILY_SCAN_BUDGET_EXCEEDED')
+    }
+  }
+  events.sort((left, right) => {
+    const a = `${left.observedAt}\0${left.eventId}`
+    const b = `${right.observedAt}\0${right.eventId}`
+    return a < b ? -1 : a > b ? 1 : 0
+  })
+  const latestByLayer = new Map()
+  for (const claim of (bundle.state.claims || []).filter((item) => item.taskId === bundle.state.task?.id)) latestByLayer.set(`${claim.type}\0${claim.scope || ''}\0${claim.environment || ''}`, claim)
+  const allLayers = [...latestByLayer.values()]
+  const snapshot = {
+    protocol: 'project-context/daily-snapshot/v2',
+    capturedAt: nowIso(),
+    date,
+    timeZone,
+    pageSize,
+    projectId: bundle.state.repo.projectId || bundle.state.repo.repoId,
+    recordLayout: bundle.state.recordLayout || 'vault',
+    repository: { root: safeSummary(current.observation.root, 360), branch: current.observation.branch, head: current.observation.head, dirty: current.observation.dirty },
+    stateGeneration: bundle.state.generation,
+    stateHash: bundle.pointer.sha256,
+    task: boundedTask(bundle.state.task),
+    runs,
+    events,
+    layers: allLayers.slice(-40).map((claim) => ({ type: claim.type, status: claim.status, scope: safeSummary(claim.scope, 160), evidenceCount: (claim.evidence || []).length })),
+    layerCoverage: { shown: Math.min(40, allLayers.length), total: allLayers.length, truncated: allLayers.length > 40 },
+    blockers: boundedRecords((bundle.state.blockers || []).filter((item) => item.taskId === bundle.state.task?.id && item.status !== 'resolved'), 12).map((item) => safeSummary(item.statement || item, 220)),
+    pitfalls: boundedRecords((bundle.state.pitfalls || []).filter((item) => item.taskId === bundle.state.task?.id && item.status !== 'stale'), 12).map((item) => safeSummary(item.statement || item, 220)),
+    nextObjective: safeSummary(bundle.state.nextObjective, 320),
+    capture: safeProjection(bundle.state.capture || {})
+  }
+  return { ...snapshot, snapshotHash: dailySnapshotHash(snapshot) }
+}
+
+function dailySummaryPage(snapshot, page) {
+  const pageSize = snapshot.pageSize || 10
+  const runPageSize = 10
+  const eventPages = Math.max(1, Math.ceil(snapshot.events.length / pageSize))
+  const runPages = Math.max(1, Math.ceil(snapshot.runs.length / runPageSize))
+  const totalPages = Math.max(eventPages, runPages)
+  assert(page <= totalPages, `--page ${page} exceeds the ${totalPages} available page(s)`, 'DAILY_PAGE_OUT_OF_RANGE')
+  return {
+    ...snapshot,
+    runs: snapshot.runs.slice((page - 1) * runPageSize, page * runPageSize),
+    events: snapshot.events.slice((page - 1) * pageSize, page * pageSize).map((event) => ({
+      eventId: event.eventId,
+      runId: event.runId,
+      type: event.type,
+      observedAt: event.observedAt,
+      summary: event.summary,
+      files: (event.files || []).slice(0, 4),
+      evidenceCount: (event.evidence || []).length
+    })),
+    eventPage: { page, pageSize, totalEvents: snapshot.events.length, totalPages: eventPages },
+    runPage: { page, pageSize: runPageSize, totalRuns: snapshot.runs.length, totalPages: runPages },
+    pagination: { page, totalPages }
+  }
+}
+
+function dailyMarkdownName(date, page) {
+  return page === 1 ? `${date}.md` : `${date}.page-${page}.md`
+}
+
+function dailyViewNames(directory, date) {
+  if (!existsSync(directory)) return []
+  return readdirSync(directory).filter((name) => name === `${date}.md` || new RegExp(`^${date}\\.page-\\d+\\.md$`).test(name)).sort()
+}
+
+function dailyViewDate(name) {
+  return String(name).match(/^(\d{4}-\d{2}-\d{2})(?:\.page-\d+)?\.md$/)?.[1] || null
+}
+
+function removeOrphanDailyDates(paths, directory, sealedDates) {
+  if (!existsSync(directory)) return
+  secureVaultDirectory(paths, directory)
+  for (const name of readdirSync(directory)) {
+    const date = dailyViewDate(name)
+    if (date && !sealedDates.has(date)) rmSync(path.join(directory, name), { force: true })
+  }
+}
+
+function removeExtraDailyViews(paths, directory, date, expectedNames) {
+  if (!existsSync(directory)) return
+  secureVaultDirectory(paths, directory)
+  const expected = new Set(expectedNames)
+  for (const name of dailyViewNames(directory, date)) {
+    if (!expected.has(name)) rmSync(path.join(directory, name), { force: true })
+  }
+}
+
+function writeDailyViews(current, bundle, snapshot, selectedPage) {
+  secureVaultDirectory(current.paths, current.paths.daily, { create: true })
+  const layout = bundle.state.recordLayout || 'vault'
+  const humanDaily = layout === 'vault' ? null : path.join(layout === 'markdown' ? current.paths.markdownContext : current.paths.portableContext, 'daily')
+  if (humanDaily) secureVaultDirectory(current.paths, humanDaily, { create: true })
+  const totalPages = dailySummaryPage(snapshot, 1).pagination.totalPages
+  const expectedNames = Array.from({ length: totalPages }, (_unused, index) => dailyMarkdownName(snapshot.date, index + 1))
+  for (let page = 1; page <= totalPages; page += 1) {
+    const summary = dailySummaryPage(snapshot, page)
+    const markdown = renderDailySummary(summary)
+    const name = dailyMarkdownName(snapshot.date, page)
+    secureVaultDirectory(current.paths, current.paths.daily)
+    atomicWrite(path.join(current.paths.daily, name), markdown)
+    if (humanDaily) {
+      secureVaultDirectory(current.paths, humanDaily)
+      atomicWrite(path.join(humanDaily, name), markdown)
+    }
+  }
+  removeExtraDailyViews(current.paths, current.paths.daily, snapshot.date, expectedNames)
+  if (humanDaily) removeExtraDailyViews(current.paths, humanDaily, snapshot.date, expectedNames)
+  return path.join(current.paths.daily, dailyMarkdownName(snapshot.date, selectedPage))
+}
+
+export function dailyCommand(args) {
+  requireUserConfirmedVault(args, 'daily')
+  assert(!(args.live && args.save), '--live cannot be combined with --save because saved daily snapshots are immutable', 'DAILY_LIVE_SAVE_CONFLICT')
+  const current = observe(args)
+  const initialBundle = loadState(current.paths)
+  assert(initialBundle, 'Repository is not registered', 'STATE_UNMANAGED')
+  assertIdentity(initialBundle, current.observation)
+  assertRecordLayout(initialBundle, args)
+  const timeZone = args.timezone && args.timezone !== true ? String(args.timezone) : Intl.DateTimeFormat().resolvedOptions().timeZone
+  try { dateInTimeZone(nowIso(), timeZone) } catch { assert(false, `Invalid IANA timezone: ${timeZone}`, 'TIMEZONE_INVALID') }
+  const date = args.date && args.date !== true ? String(args.date) : dateInTimeZone(nowIso(), timeZone)
+  assert(/^\d{4}-\d{2}-\d{2}$/.test(date), '--date must use YYYY-MM-DD', 'DATE_INVALID')
+  const dateProbe = new Date(`${date}T12:00:00.000Z`)
+  assert(Number.isFinite(dateProbe.getTime()) && dateProbe.toISOString().slice(0, 10) === date, '--date must be a real calendar date', 'DATE_INVALID')
+  const page = args.page === undefined ? 1 : parseInteger(args.page)
+  const requestedPageSize = args['page-size'] === undefined ? null : parseInteger(args['page-size'])
+  const pageSize = requestedPageSize || 10
+  assert(Number.isInteger(page) && page >= 1, '--page must be a positive integer', 'DAILY_PAGE_INVALID')
+  assert(Number.isInteger(pageSize) && pageSize >= 1 && pageSize <= 10, '--page-size must be between 1 and 10', 'DAILY_PAGE_SIZE_INVALID')
+  const snapshotFile = path.join(current.paths.daily, `${date}.json`)
+
+  const finalize = (bundle, snapshot, saved) => {
+    assert(snapshot.date === date && snapshot.timeZone === timeZone, `Saved daily snapshot ${date} uses timezone ${snapshot.timeZone}; use --live to preview another timezone without overwriting it`, 'DAILY_SNAPSHOT_TIMEZONE_CONFLICT')
+    assert(!requestedPageSize || !snapshot.pageSize || requestedPageSize === snapshot.pageSize, `Saved daily snapshot ${date} uses page size ${snapshot.pageSize}; use --live to preview a different page size without overwriting stable filenames`, 'DAILY_PAGE_SIZE_CONFLICT')
+    const summary = dailySummaryPage(snapshot, page)
+    const markdown = renderDailySummary(summary)
+    const savedPath = saved ? writeDailyViews(current, bundle, snapshot, page) : null
+    const usesSavedSnapshot = existsSync(snapshotFile) && !args.live
+    const result = {
+      command: 'daily',
+      saved,
+      frozen: usesSavedSnapshot,
+      source: usesSavedSnapshot ? 'saved-snapshot' : 'live-derived-preview',
+      path: savedPath,
+      snapshot: usesSavedSnapshot ? snapshotFile : null,
+      savedSnapshotAvailable: existsSync(snapshotFile),
+      summary: safeProjection(summary),
+      markdown
+    }
+    assert(Buffer.byteLength(stableJson(result, 0), 'utf8') <= 64 * 1024, 'Daily page exceeded its hard 64 KiB output budget; use a smaller page size or shorter recorded summaries', 'DAILY_VIEW_BUDGET_EXCEEDED')
+    return result
+  }
+
+  if (existsSync(snapshotFile) && !args.live && !args.save) return finalize(initialBundle, readDailySnapshot(snapshotFile, current.paths), false)
+  if (!args.save) return finalize(initialBundle, buildDailySnapshot(current, initialBundle, date, timeZone, pageSize), false)
+
+  const runId = required(args, 'run', 'Saving a daily summary requires --run from the current session')
+  return withStateLock(current.paths, () => {
+    const bundle = loadState(current.paths)
+    assert(bundle && bundle.pointer.sha256 === initialBundle.pointer.sha256, 'State changed while preparing the daily snapshot; retry from the current state', 'STATE_CAS_CONFLICT')
+    assert(bundle.state.activeRuns.some((item) => item.runId === runId), `Run ${runId} is not active in this context`, 'RUN_NOT_ACTIVE_IN_CONTEXT')
+    validateRunSession(current.paths, runId, args)
+    let snapshot
+    if (existsSync(snapshotFile)) snapshot = readDailySnapshot(snapshotFile, current.paths)
+    else {
+      snapshot = buildDailySnapshot(current, bundle, date, timeZone, pageSize)
+      secureVaultDirectory(current.paths, current.paths.daily, { create: true })
+      atomicWrite(snapshotFile, stableJson(snapshot))
+    }
+    return finalize(bundle, snapshot, true)
+  })
+}
+
+const RELINK_POINTER_MAX_BYTES = 64 * 1024
+const RELINK_GENERATION_MAX_BYTES = 8 * 1024 * 1024
+const RELINK_PREVIEW_TOTAL_BYTES = 64 * 1024 * 1024
+const RELINK_CHAIN_TOTAL_BYTES = 128 * 1024 * 1024
+const RELINK_MAX_CHAIN_GENERATIONS = 5000
+
+function relinkPathAssert(condition, message) {
+  if (condition) return
+  const error = new Error(message)
+  error.code = 'RELINK_SOURCE_CORRUPT'
+  error.relinkPathUnsafe = true
+  throw error
+}
+
+function relinkReadBudget(maximumBytes, maximumFiles) {
+  return { bytes: 0, files: 0, maximumBytes, maximumFiles }
+}
+
+function relinkSourceDirectory(directory, allowedRoot, label) {
+  try {
+    const stats = lstatSync(directory)
+    relinkPathAssert(stats.isDirectory() && !stats.isSymbolicLink(), `${label} must be a real directory, not a symbolic link or junction`)
+    const resolved = realpathSync.native(directory)
+    const resolvedRoot = realpathSync.native(allowedRoot)
+    relinkPathAssert(isWithin(resolved, resolvedRoot), `${label} resolves outside the selected context store`)
+    return resolved
+  } catch (error) {
+    if (error.code === 'RELINK_SOURCE_CORRUPT') throw error
+    assert(false, `${label} cannot be inspected safely (${error.code || 'ERROR'})`, 'RELINK_SOURCE_CORRUPT')
+  }
+}
+
+function readRelinkSourceFile(file, allowedRoot, label, budget, maximumFileBytes = RELINK_GENERATION_MAX_BYTES) {
+  try {
+    const stats = lstatSync(file)
+    relinkPathAssert(stats.isFile() && !stats.isSymbolicLink(), `${label} must be a regular file, not a symbolic link`)
+    assert(stats.size <= maximumFileBytes, `${label} exceeds its ${maximumFileBytes}-byte relink read budget`, 'RELINK_SEARCH_BUDGET_EXCEEDED')
+    if (budget) {
+      budget.files += 1
+      budget.bytes += stats.size
+      assert(budget.files <= budget.maximumFiles && budget.bytes <= budget.maximumBytes, `Relink source reads exceeded ${budget.maximumFiles} files or ${budget.maximumBytes} bytes`, 'RELINK_SEARCH_BUDGET_EXCEEDED')
+    }
+    const resolved = realpathSync.native(file)
+    const resolvedRoot = realpathSync.native(allowedRoot)
+    relinkPathAssert(isWithin(resolved, resolvedRoot), `${label} resolves outside the selected context store`)
+    return readFileSync(resolved, 'utf8')
+  } catch (error) {
+    if (['RELINK_SOURCE_CORRUPT', 'RELINK_SEARCH_BUDGET_EXCEEDED'].includes(error.code)) throw error
+    assert(false, `${label} cannot be read safely (${error.code || 'ERROR'})`, 'RELINK_SOURCE_CORRUPT')
+  }
+}
+
+function parseRelinkJson(raw, label) {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    assert(false, `${label} is not valid JSON`, 'RELINK_SOURCE_CORRUPT')
+  }
+}
+
+function readRelinkCandidate(contextDirectory, allowedRoot, options = {}) {
+  const budget = options.budget || relinkReadBudget(RELINK_PREVIEW_TOTAL_BYTES, 5000)
+  relinkSourceDirectory(contextDirectory, allowedRoot, 'Relink source context')
+  const stateDirectory = path.join(contextDirectory, 'state')
+  const pointerPath = path.join(stateDirectory, 'current.json')
+  if (!existsSync(pointerPath)) return null
+  relinkSourceDirectory(stateDirectory, allowedRoot, 'Relink source state directory')
+  const generationsDirectory = path.join(stateDirectory, 'generations')
+  relinkSourceDirectory(generationsDirectory, allowedRoot, 'Relink source generations directory')
+  const pointer = parseRelinkJson(readRelinkSourceFile(pointerPath, stateDirectory, 'Relink source pointer', budget, RELINK_POINTER_MAX_BYTES), 'Relink source pointer')
+  assert(pointer.protocol === 'project-context/v1' && Number.isInteger(pointer.generation) && /^[a-f0-9]{64}$/.test(String(pointer.sha256 || '')), 'Relink source pointer is invalid', 'RELINK_SOURCE_CORRUPT')
+  assert(/^generation-\d{8}(?:-[a-f0-9]{12})?\.json$/.test(String(pointer.file || '')), 'Relink source pointer contains an unsafe generation filename', 'RELINK_SOURCE_CORRUPT')
+  const generationPath = path.join(generationsDirectory, pointer.file)
+  assert(isWithin(generationPath, generationsDirectory) && existsSync(generationPath), 'Relink source generation is missing or unsafe', 'RELINK_SOURCE_CORRUPT')
+  const raw = readRelinkSourceFile(generationPath, generationsDirectory, 'Relink source generation', budget)
+  assert(sha256(raw) === pointer.sha256, 'Relink source generation hash does not match its pointer', 'RELINK_SOURCE_CORRUPT')
+  let state = parseRelinkJson(raw, 'Relink source generation')
+  assert(state.protocol === 'project-context/v1', 'Relink source protocol is unsupported', 'RELINK_SOURCE_CORRUPT')
+  assert([1, 2].includes(state.schemaVersion || 1), 'Relink source state schema is unsupported', 'RELINK_SOURCE_CORRUPT')
+  assert(Number.isInteger(state.generation) && state.generation === pointer.generation, 'Relink source generation differs from its pointer', 'RELINK_SOURCE_CORRUPT')
+  const expectedContextId = path.basename(contextDirectory)
+  const expectedWorkspaceId = path.basename(path.resolve(contextDirectory, '..', '..'))
+  const expectedRepoId = path.basename(path.resolve(contextDirectory, '..', '..', '..', '..'))
+  assert(state.repo?.repoId === expectedRepoId && state.repo?.workspaceId === expectedWorkspaceId && state.repo?.contextId === expectedContextId, 'Relink source identity does not match its repository/workspace/context directory', 'RELINK_SOURCE_IDENTITY_CONFLICT')
+  const projectId = state.repo?.projectId || `project-${sha256(state.repo?.canonicalRemote || state.repo?.repoId || '').slice(0, 20)}`
+  if (options.validateChain) {
+    assert(pointer.generation <= RELINK_MAX_CHAIN_GENERATIONS, `Relink source chain exceeds ${RELINK_MAX_CHAIN_GENERATIONS} generations`, 'RELINK_SEARCH_BUDGET_EXCEEDED')
+    const visited = new Set()
+    let cursorHash = pointer.sha256
+    let expectedGeneration = pointer.generation
+    let cursorEntry = { raw, file: generationPath }
+    while (cursorHash) {
+      assert(!visited.has(cursorHash), 'Relink source generation chain contains a cycle', 'RELINK_SOURCE_CORRUPT')
+      visited.add(cursorHash)
+      assert(sha256(cursorEntry.raw) === cursorHash, 'Relink source generation chain hash does not match', 'RELINK_SOURCE_CORRUPT')
+      const generation = parseRelinkJson(cursorEntry.raw, `Relink active generation ${path.basename(cursorEntry.file)}`)
+      assert(generation.protocol === 'project-context/v1' && generation.generation === expectedGeneration, 'Relink source generation chain is inconsistent', 'RELINK_SOURCE_CORRUPT')
+      assert([1, 2].includes(generation.schemaVersion || 1), 'Relink source generation chain contains an unsupported schema', 'RELINK_SOURCE_CORRUPT')
+      assert(generation.repo?.repoId === expectedRepoId && generation.repo?.workspaceId === expectedWorkspaceId && generation.repo?.contextId === expectedContextId, 'Relink source generation chain changes repository identity', 'RELINK_SOURCE_IDENTITY_CONFLICT')
+      const parentHash = generation.parentGenerationHash
+      if (expectedGeneration === 1) assert(parentHash === null, 'Relink source generation 1 must terminate the chain', 'RELINK_SOURCE_CORRUPT')
+      else assert(/^[a-f0-9]{64}$/.test(String(parentHash || '')), 'Relink source parent generation hash is invalid', 'RELINK_SOURCE_CORRUPT')
+      expectedGeneration -= 1
+      cursorHash = parentHash
+      if (!cursorHash) break
+      const stem = `generation-${String(expectedGeneration).padStart(8, '0')}`
+      const candidates = [`${stem}-${cursorHash.slice(0, 12)}.json`, `${stem}.json`]
+      cursorEntry = null
+      for (const name of candidates) {
+        const file = path.join(generationsDirectory, name)
+        if (!existsSync(file)) continue
+        const candidateRaw = readRelinkSourceFile(file, generationsDirectory, `Relink active generation ${name}`, budget)
+        if (sha256(candidateRaw) === cursorHash) {
+          cursorEntry = { raw: candidateRaw, file }
+          break
+        }
+      }
+      assert(cursorEntry, 'Relink source generation chain is incomplete', 'RELINK_SOURCE_CORRUPT')
+    }
+    assert(expectedGeneration === 0, 'Relink source generation chain does not terminate at generation 1', 'RELINK_SOURCE_CORRUPT')
+  }
+  if ((state.schemaVersion || 1) === 1) {
+    state = {
+      ...state,
+      schemaVersion: 2,
+      migratedFromSchemaVersion: 1,
+      repo: { ...state.repo, projectId: state.repo?.projectId || `project-${sha256(state.repo?.canonicalRemote || state.repo?.repoId || '').slice(0, 20)}` },
+      recordLayout: state.recordLayout || 'vault',
+      profile: state.profile || null,
+      relinkHistory: state.relinkHistory || []
+    }
+  }
+  return { contextDirectory, pointerPath, generationPath, pointer, state, projectId }
+}
+
+function findRelinkSources(paths, projectId, requestedHash = null) {
+  const repositoriesRoot = path.join(paths.vault, 'repositories')
+  if (!existsSync(repositoriesRoot)) return []
+  relinkSourceDirectory(repositoriesRoot, paths.vault, 'Relink repositories root')
+  const previews = []
+  let inspected = 0
+  const maximumContexts = 2000
+  const previewBudget = relinkReadBudget(RELINK_PREVIEW_TOTAL_BYTES, maximumContexts * 2)
+  const chainBudget = relinkReadBudget(RELINK_CHAIN_TOTAL_BYTES, RELINK_MAX_CHAIN_GENERATIONS * 2)
+  for (const repository of readdirSync(repositoriesRoot, { withFileTypes: true })) {
+    assert(!repository.isSymbolicLink(), `Relink repository entry ${repository.name} must not be a symbolic link or junction`, 'RELINK_SOURCE_CORRUPT')
+    if (!repository.isDirectory()) continue
+    const repositoryRoot = path.join(repositoriesRoot, repository.name)
+    relinkSourceDirectory(repositoryRoot, repositoriesRoot, `Relink repository ${repository.name}`)
+    const workspacesRoot = path.join(repositoriesRoot, repository.name, 'workspaces')
+    if (!existsSync(workspacesRoot)) continue
+    relinkSourceDirectory(workspacesRoot, repositoryRoot, `Relink workspaces directory for ${repository.name}`)
+    for (const workspace of readdirSync(workspacesRoot, { withFileTypes: true })) {
+      assert(!workspace.isSymbolicLink(), `Relink workspace entry ${workspace.name} must not be a symbolic link or junction`, 'RELINK_SOURCE_CORRUPT')
+      if (!workspace.isDirectory()) continue
+      const workspaceRoot = path.join(workspacesRoot, workspace.name)
+      relinkSourceDirectory(workspaceRoot, workspacesRoot, `Relink workspace ${workspace.name}`)
+      const contextsRoot = path.join(workspacesRoot, workspace.name, 'contexts')
+      if (!existsSync(contextsRoot)) continue
+      relinkSourceDirectory(contextsRoot, workspaceRoot, `Relink contexts directory for ${workspace.name}`)
+      for (const context of readdirSync(contextsRoot, { withFileTypes: true })) {
+        assert(!context.isSymbolicLink(), `Relink context entry ${context.name} must not be a symbolic link or junction`, 'RELINK_SOURCE_CORRUPT')
+        if (!context.isDirectory()) continue
+        inspected += 1
+        assert(inspected <= maximumContexts, `Relink source search exceeded ${maximumContexts} contexts; specify a smaller transferred store`, 'RELINK_SEARCH_BUDGET_EXCEEDED')
+        const contextDirectory = path.join(contextsRoot, context.name)
+        if (canonicalPath(contextDirectory) === canonicalPath(paths.context)) continue
+        let preview = null
+        try {
+          preview = readRelinkCandidate(contextDirectory, repositoriesRoot, { budget: previewBudget })
+        } catch (error) {
+          if (error.relinkPathUnsafe || error.code === 'RELINK_SEARCH_BUDGET_EXCEEDED') throw error
+          if (['RELINK_SOURCE_CORRUPT', 'RELINK_SOURCE_IDENTITY_CONFLICT'].includes(error.code)) continue
+          throw error
+        }
+        if (preview?.projectId === projectId) previews.push(preview)
+      }
+    }
+  }
+  previews.sort((left, right) => {
+    const leftKey = `${left.state.updatedAt || left.pointer.updatedAt || ''}\0${left.pointer.sha256}`
+    const rightKey = `${right.state.updatedAt || right.pointer.updatedAt || ''}\0${right.pointer.sha256}`
+    return leftKey > rightKey ? -1 : leftKey < rightKey ? 1 : 0
+  })
+  const selectedPreview = requestedHash ? previews.find((item) => item.pointer.sha256 === requestedHash) : previews.length === 1 ? previews[0] : null
+  const sources = selectedPreview
+    ? [assertRelinkSourceStable(
+        selectedPreview,
+        readRelinkCandidate(selectedPreview.contextDirectory, repositoriesRoot, { budget: chainBudget, validateChain: true }),
+        projectId,
+        requestedHash
+      )]
+    : []
+  return { sources, candidateCount: previews.length }
+}
+
+export function assertRelinkSourceStable(selectedPreview, validated, projectId, requestedHash = null) {
+  const previewHash = selectedPreview?.pointer?.sha256 || null
+  const validatedHash = validated?.pointer?.sha256 || null
+  assert(validated?.projectId === projectId, 'Relink source project identity changed after selection; retry from a fresh profile', 'RELINK_SOURCE_CHANGED')
+  assert(previewHash && validatedHash === previewHash, 'Relink source state changed after selection; retry with its new state hash', 'RELINK_SOURCE_CHANGED')
+  if (requestedHash) assert(validatedHash === requestedHash, 'Relink source no longer matches --source-state-hash; retry from a fresh profile', 'RELINK_SOURCE_CHANGED')
+  return validated
+}
+
+function relinkedRecords(records, sourceHash, reason) {
+  return (records || []).map((item) => typeof item !== 'object' || item === null ? item : {
+    ...item,
+    status: 'stale',
+    priorStatus: item.status || null,
+    staleReason: reason,
+    relinkedFromStateHash: sourceHash
+  })
+}
+
+export function relinkCommand(args) {
+  requireUserConfirmedVault(args, 'relink')
+  const current = observe(args)
+  const projectId = required(args, 'project-id', '--project-id from the transferred Project Profile is required')
+  assert(/^project-[A-Za-z0-9_-]{6,80}$/.test(projectId), '--project-id has an invalid format', 'PROJECT_ID_INVALID')
+  const reason = required(args, 'reason', '--reason is required for cross-workspace relinking')
+  required(args, 'authority', '--authority from the current user is required for relinking')
+  assert(args['current-session-authority'], '--current-session-authority is required for relinking', 'CURRENT_AUTHORITY_REQUIRED')
+  assert(!loadState(current.paths), 'This workspace already has context state; use begin/recovery instead of relink', 'RELINK_TARGET_ALREADY_MANAGED')
+  const requestedHash = args['source-state-hash'] && args['source-state-hash'] !== true ? String(args['source-state-hash']) : null
+  if (requestedHash) assert(/^[a-f0-9]{64}$/.test(requestedHash), '--source-state-hash must be a SHA-256 digest from profile or recovery output', 'RELINK_SOURCE_HASH_INVALID')
+  const search = findRelinkSources(current.paths, projectId, requestedHash)
+  assert(search.candidateCount > 0, `No transferred state was found for project ${projectId}`, 'RELINK_SOURCE_NOT_FOUND')
+  assert(requestedHash || search.candidateCount === 1, `Found ${search.candidateCount} relink sources for ${projectId}; select one explicitly with --source-state-hash`, 'RELINK_SOURCE_AMBIGUOUS')
+  const source = search.sources[0]
+  assert(source, `No relink source matches state hash ${requestedHash}`, 'RELINK_SOURCE_NOT_FOUND')
+  const sourceRemote = normalizeRemote(source.state.repo?.canonicalRemote || '')
+  const currentRemote = normalizeRemote(current.observation.canonicalRemote || '')
+  if (sourceRemote && currentRemote && sourceRemote !== currentRemote) {
+    assert(args['allow-remote-change'], 'Canonical remote differs from the selected source; --allow-remote-change is required under current-session authority', 'RELINK_REMOTE_CONFLICT')
+  }
+  if (args['reharden-store-acl']) rehardenVaultAcl(current.paths)
+  ensureVault(current.paths, current.observation)
+  return withStateLock(current.paths, () => {
+    assert(!loadState(current.paths), 'Relink target state was created concurrently', 'STATE_CAS_CONFLICT')
+    const sameRevision = source.state.repo?.contextId === current.observation.contextId &&
+      source.state.observation?.branch === current.observation.branch &&
+      source.state.observation?.head === current.observation.head &&
+      source.state.observation?.statusFingerprint === current.observation.statusFingerprint
+    const sourcePrd = source.state.task?.prd || null
+    const prdAvailable = !sourcePrd || (existsSync(sourcePrd.path) && statSync(sourcePrd.path).isFile() && sha256File(sourcePrd.path) === sourcePrd.sha256)
+    const staleReason = 'Record was copied as historical context during workspace/device relinking and must be revalidated against the new live checkout.'
+    const manifest = generateProjectMap(current.paths, current.observation)
+    const layout = args['record-layout'] !== undefined ? current.recordLayout : source.state.recordLayout || 'vault'
+    let state = initialState(current.observation, { recordLayout: layout, projectId })
+    state = {
+      ...state,
+      task: source.state.task || null,
+      taskHistory: source.state.taskHistory || [],
+      profile: projectProfile(args, source.state.profile || null, manifest, current.observation),
+      confirmedFacts: relinkedRecords(source.state.confirmedFacts, source.pointer.sha256, staleReason),
+      hypotheses: relinkedRecords(source.state.hypotheses, source.pointer.sha256, staleReason),
+      blockers: relinkedRecords(source.state.blockers, source.pointer.sha256, staleReason),
+      pitfalls: relinkedRecords(source.state.pitfalls, source.pointer.sha256, staleReason),
+      claims: relinkedRecords(source.state.claims, source.pointer.sha256, staleReason),
+      architectureClaims: relinkedRecords(source.state.architectureClaims, source.pointer.sha256, staleReason),
+      stage: 'relinked',
+      map: mapReference(manifest, current.paths),
+      recordLayout: layout,
+      vaultSelection: vaultSelectionRecord(current.paths.vault, 'relink', layout),
+      activeRuns: [],
+      abandonedRuns: [],
+      lastRun: source.state.lastRun ? {
+        runId: source.state.lastRun.runId || null,
+        status: source.state.lastRun.status || null,
+        endedAt: source.state.lastRun.endedAt || null,
+        summary: source.state.lastRun.summary || null,
+        nextObjective: source.state.lastRun.nextObjective || null,
+        path: null,
+        historicalRelinkOnly: true,
+        sourceAbsolutePathDiscarded: true,
+        sourceStateHash: source.pointer.sha256
+      } : null,
+      nextObjective: source.state.nextObjective || source.state.task?.objective || null,
+      relinkHistory: [...(source.state.relinkHistory || []), {
+        projectId,
+        sourceStateHash: source.pointer.sha256,
+        sourceContext: source.contextDirectory,
+        targetWorkspaceId: current.observation.workspaceId,
+        targetContextId: current.observation.contextId,
+        reason,
+        authorityFingerprint: sha256(String(args.authority)),
+        recordedAt: nowIso(),
+        oldRunsCopiedAsActive: false
+      }],
+      trust: source.state.task
+        ? sameRevision && prdAvailable
+          ? { status: 'READY', reasons: [] }
+          : { status: 'STALE', reasons: [
+              !sameRevision ? 'Relinked checkout differs from the source revision; begin with explicit live-change reconciliation before project writes.' : null,
+              !prdAvailable ? 'The transferred task PRD path/hash is not valid on this device; bind and approve the current PRD before project writes.' : null
+            ].filter(Boolean) }
+        : { status: 'UNMANAGED', reasons: ['The transferred project has no active task.'] }
+    }
+    const bundle = writeState(current.paths, null, state)
+    return {
+      command: 'relink',
+      projectId,
+      sourceStateHash: source.pointer.sha256,
+      candidateCount: search.candidateCount,
+      copiedActiveRuns: false,
+      trust: state.trust,
+      recovery: recoveryCard(bundle, current.observation, current.paths, state.vaultSelection)
+    }
+  })
+}
+
+function refreshEvidenceManifest(paths, runEvidenceDir) {
   const records = []
   if (existsSync(runEvidenceDir)) {
+    secureVaultDirectory(paths, runEvidenceDir)
     for (const entry of readdirSync(runEvidenceDir, { withFileTypes: true })) {
+      assert(!entry.isSymbolicLink(), `Evidence entry ${entry.name} must not be a link or junction`, 'VAULT_PATH_UNSAFE')
       if (!entry.isDirectory()) continue
-      const metadata = path.join(runEvidenceDir, entry.name, 'evidence.json')
-      if (existsSync(metadata)) records.push(readJson(metadata))
+      const evidenceDirectory = secureVaultDirectory(paths, path.join(runEvidenceDir, entry.name))
+      const metadata = path.join(evidenceDirectory, 'evidence.json')
+      if (existsSync(metadata)) records.push(JSON.parse(readSecureVaultFile(paths, metadata)))
     }
   }
   const rows = records.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt)).map((item) => `| ${item.evidenceId} | ${item.kind || 'attachment'} | ${String(item.label).replace(/\|/g, '\\|').replace(/\s+/g, ' ')} | ${item.size} | \`${item.sha256}\` | ${item.storageMode} | ${item.modelAccess} |`).join('\n') || '| — | — | — | — | — | — | — |'
@@ -2104,8 +3051,10 @@ export function evidenceCommand(args) {
     const modelAccess = Boolean(args['model-access'])
     if (modelAccess) validateReleaseCredential(args, 'model-access')
     const evidenceId = randomId('EVID')
-    const evidenceDir = ensureDir(path.join(current.paths.evidence, runId, evidenceId))
-    const destination = path.join(evidenceDir, path.basename(sourceFile))
+    const evidenceDir = secureVaultDirectory(current.paths, path.join(current.paths.evidence, runId, evidenceId), { create: true })
+    const sourceExtension = path.extname(path.basename(sourceFile)).toLowerCase()
+    const safeExtension = /^\.[a-z0-9]{1,12}$/.test(sourceExtension) ? sourceExtension : ''
+    const destination = path.join(evidenceDir, `payload${safeExtension}`)
     copyFileSync(sourceFile, destination)
     const metadata = {
       protocol: 'project-context/evidence/v1',
@@ -2113,6 +3062,7 @@ export function evidenceCommand(args) {
       runId,
       kind: evidenceKind,
       label: args.label && args.label !== true ? String(args.label) : path.basename(sourceFile),
+      originalFileName: path.basename(sourceFile),
       sourcePath: sourceFile,
       storedPath: destination,
       size: statSync(destination).size,
@@ -2131,7 +3081,7 @@ export function evidenceCommand(args) {
     }
     const metadataPath = path.join(evidenceDir, 'evidence.json')
     writeJsonAtomic(metadataPath, metadata)
-    refreshEvidenceManifest(path.join(current.paths.evidence, runId))
+    refreshEvidenceManifest(current.paths, path.join(current.paths.evidence, runId))
     const evidenceRecordHash = sha256(stableJson(metadata))
     appendRunEvent(current.paths, runId, {
       type: modelAccess ? 'model-access' : 'observation',
@@ -2208,7 +3158,8 @@ function validateReleaseCredential(args, eventType) {
   const token = required(args, 'route-token', '--route-token from a current release route is required')
   assert(args.authority && args.authority !== true && args['current-session-authority'], 'Current-session authority text and --current-session-authority are required', 'CURRENT_AUTHORITY_REQUIRED')
   const result = routeCommand({ ...args, event: eventType, validate: token })
-  assert(result.valid && result.executable && result.mode === 'release-with-provenance', 'Release route credential is invalid, non-executable, or has the wrong mode', 'ROUTE_CREDENTIAL_INVALID')
+  assert(result.valid && result.recordingReady && result.mode === 'release-with-provenance', 'Release route credential is invalid, not recording-ready, or has the wrong mode', 'ROUTE_CREDENTIAL_INVALID')
+  assert(result.executable, 'The standalone recorder does not execute export, import, or model-disclosure actions; current host authorization cannot turn recording readiness into protocol execution', 'PROTOCOL_EXECUTION_DISABLED')
   return result
 }
 
@@ -2216,19 +3167,23 @@ function verifyEvidenceArchive(paths) {
   const errors = []
   const checked = []
   if (!existsSync(paths.evidence)) return { errors, checked }
+  secureVaultDirectory(paths, paths.evidence)
   for (const runEntry of readdirSync(paths.evidence, { withFileTypes: true })) {
-    if (!runEntry.isDirectory() || runEntry.isSymbolicLink()) continue
+    assert(!runEntry.isSymbolicLink(), `Evidence run ${runEntry.name} must not be a link or junction`, 'VAULT_PATH_UNSAFE')
+    if (!runEntry.isDirectory()) continue
     const runId = runEntry.name
-    const runRoot = path.join(paths.evidence, runId)
+    const runRoot = secureVaultDirectory(paths, path.join(paths.evidence, runId))
     for (const evidenceEntry of readdirSync(runRoot, { withFileTypes: true })) {
-      if (!evidenceEntry.isDirectory() || evidenceEntry.isSymbolicLink()) continue
+      assert(!evidenceEntry.isSymbolicLink(), `Evidence item ${evidenceEntry.name} must not be a link or junction`, 'VAULT_PATH_UNSAFE')
+      if (!evidenceEntry.isDirectory()) continue
+      secureVaultDirectory(paths, path.join(runRoot, evidenceEntry.name))
       const metadataPath = path.join(runRoot, evidenceEntry.name, 'evidence.json')
       if (!existsSync(metadataPath)) {
         errors.push(`Evidence ${runId}/${evidenceEntry.name} is missing evidence.json.`)
         continue
       }
       try {
-        const record = readJson(metadataPath)
+        const record = JSON.parse(readSecureVaultFile(paths, metadataPath))
         const recordErrors = validateEvidenceRecord(paths, runId, metadataPath, record)
         checked.push({ runId, evidenceId: evidenceEntry.name, sha256: record.sha256 || null, valid: recordErrors.length === 0 })
         for (const message of recordErrors) errors.push(`Evidence ${runId}/${evidenceEntry.name}: ${message}.`)
@@ -2408,13 +3363,14 @@ export function finishCommand(args) {
 }
 
 function verifyGenerationChain(paths, pointer) {
+  secureVaultDirectory(paths, paths.generations)
   const files = readdirSync(paths.generations).filter((name) => /^generation-\d{8}(?:-[a-f0-9]{12})?\.json$/.test(name)).sort()
   const errors = []
   const warnings = []
   const byHash = new Map()
   for (const name of files) {
     const file = path.join(paths.generations, name)
-    const raw = readFileSync(file, 'utf8')
+    const raw = readSecureVaultFile(paths, file)
     let state
     try {
       state = JSON.parse(raw)
@@ -2455,9 +3411,11 @@ function verifyAllRunRecords(paths) {
   const checks = []
   const errors = []
   if (!existsSync(paths.runs)) return { checks, errors }
+  secureVaultDirectory(paths, paths.runs)
   for (const month of readdirSync(paths.runs, { withFileTypes: true })) {
-    if (!month.isDirectory()) continue
-    const monthPath = path.join(paths.runs, month.name)
+    assert(!month.isSymbolicLink(), `Run month ${month.name} must not be a link or junction`, 'VAULT_PATH_UNSAFE')
+    if (!month.isDirectory() || !/^\d{4}-\d{2}$/.test(month.name)) continue
+    const monthPath = secureVaultDirectory(paths, path.join(paths.runs, month.name))
     for (const name of readdirSync(monthPath).filter((entry) => entry.endsWith('.json')).sort()) {
       const runId = name.replace(/\.json$/i, '')
       try {
@@ -2494,18 +3452,33 @@ export function verifyCommand(args) {
       assert(lockedBundle.state.activeRuns.some((item) => item.runId === runId), `Run ${runId} is not active in this context`, 'RUN_NOT_ACTIVE_IN_CONTEXT')
       validateRunSession(current.paths, runId, args)
       atomicWrite(current.paths.projectContext, renderProjectContext(lockedBundle.state, lockedBundle.pointer))
+      atomicWrite(current.paths.projectProfile, renderProjectProfile(lockedBundle.state, lockedBundle.pointer))
       const architecture = renderArchitectureView(current.paths, lockedBundle.state)
       if (architecture !== null) atomicWrite(current.paths.architecture, architecture)
       if (lockedBundle.state.map?.manifest && isWithin(lockedBundle.state.map.manifest, current.paths.context) && existsSync(lockedBundle.state.map.manifest)) {
-        const manifest = readJson(lockedBundle.state.map.manifest)
+        secureVaultDirectory(current.paths, path.dirname(lockedBundle.state.map.manifest))
+        const manifest = JSON.parse(readSecureVaultFile(current.paths, lockedBundle.state.map.manifest))
         const versionedFileIndex = path.join(path.dirname(lockedBundle.state.map.manifest), manifest.files?.fileIndex || 'FILE_INDEX.md')
-        if (isWithin(versionedFileIndex, path.dirname(lockedBundle.state.map.manifest)) && existsSync(versionedFileIndex)) atomicWrite(current.paths.fileIndex, readFileSync(versionedFileIndex, 'utf8'))
+        if (isWithin(versionedFileIndex, path.dirname(lockedBundle.state.map.manifest)) && existsSync(versionedFileIndex)) atomicWrite(current.paths.fileIndex, readSecureVaultFile(current.paths, versionedFileIndex))
       }
       for (const entry of listRuns(current.paths)) refreshRunView(current.paths, entry.run.runId)
+      if (existsSync(current.paths.daily)) {
+        const sealedDates = new Set()
+        for (const name of readdirSync(current.paths.daily).filter((item) => /^\d{4}-\d{2}-\d{2}\.json$/.test(item)).sort()) {
+          const snapshot = readDailySnapshot(path.join(current.paths.daily, name), current.paths)
+          assert(snapshot.date === name.slice(0, 10), `Daily snapshot ${name} does not match its embedded date`, 'DAILY_SNAPSHOT_DATE_CONFLICT')
+          sealedDates.add(snapshot.date)
+          writeDailyViews(current, lockedBundle, snapshot, 1)
+        }
+        removeOrphanDailyDates(current.paths, current.paths.daily, sealedDates)
+        const layout = lockedBundle.state.recordLayout || 'vault'
+        const mirrorDaily = layout === 'vault' ? null : path.join(layout === 'markdown' ? current.paths.markdownContext : current.paths.portableContext, 'daily')
+        if (mirrorDaily) removeOrphanDailyDates(current.paths, mirrorDaily, sealedDates)
+      }
       appendRunEvent(current.paths, runId, {
         type: 'verification',
-        summary: 'Regenerated derived vault views from machine authority.',
-        details: 'PROJECT_CONTEXT, ARCHITECTURE, FILE_INDEX, and run Markdown were regenerated where their machine sources exist.',
+        summary: 'Regenerated derived context views from machine authority.',
+        details: 'PROJECT_CONTEXT, PROJECT_PROFILE, ARCHITECTURE, FILE_INDEX, run Markdown, and sealed daily views were regenerated where their machine sources exist.',
         source: 'contextctl-verify-repair'
       })
       writeState(current.paths, lockedBundle, { ...lockedBundle.state, stage: 'verification-view-repair' })
@@ -2521,6 +3494,13 @@ export function verifyCommand(args) {
   const derived = verifyDerivedViews(current.paths, bundle)
   if (!derived.projectContextPresent) errors.push('PROJECT_CONTEXT.md is missing.')
   if (!derived.projectContextMatches) errors.push('PROJECT_CONTEXT.md does not match machine state.')
+  const legacyProfilePending = bundle.sourceSchemaVersion === 1 && !derived.projectProfilePresent
+  if (!derived.projectProfilePresent && !legacyProfilePending) errors.push('PROJECT_PROFILE.md is missing.')
+  if (!derived.projectProfileMatches && !legacyProfilePending) errors.push('PROJECT_PROFILE.md does not match machine state.')
+  if (legacyProfilePending) warnings.push('Schema-v1 state was loaded compatibly. PROJECT_PROFILE.md will be created by the next authenticated state write; use begin/profile --save rather than editing generations manually.')
+  if (derived.recordLayoutExpected && !derived.recordLayoutViewsMatch) {
+    for (const view of derived.recordLayoutViews.filter((item) => !item.present || !item.matches)) errors.push(`Record-layout mirror ${view.name} is missing or does not match machine state.`)
+  }
   if (!derived.architectureExpected) errors.push('The versioned architecture source is missing or unsafe.')
   else if (!derived.architectureMatches) errors.push('ARCHITECTURE.md does not match its map generation and machine claims.')
   const chain = verifyGenerationChain(current.paths, bundle.pointer)
@@ -2536,6 +3516,54 @@ export function verifyCommand(args) {
   }
   const evidenceCheck = verifyEvidenceArchive(current.paths)
   errors.push(...evidenceCheck.errors)
+  const dailySnapshots = []
+  const sealedDailyDates = new Set()
+  const dailyLayout = bundle.state.recordLayout || 'vault'
+  const dailyMirrorRoot = dailyLayout === 'vault' ? null : path.join(dailyLayout === 'markdown' ? current.paths.markdownContext : current.paths.portableContext, 'daily')
+  if (existsSync(current.paths.daily)) {
+    for (const name of readdirSync(current.paths.daily).filter((item) => /^\d{4}-\d{2}-\d{2}\.json$/.test(item)).sort()) {
+      try {
+        const snapshot = readDailySnapshot(path.join(current.paths.daily, name), current.paths)
+        assert(snapshot.date === name.slice(0, 10), `Daily snapshot ${name} does not match its embedded date`, 'DAILY_SNAPSHOT_DATE_CONFLICT')
+        sealedDailyDates.add(snapshot.date)
+        const totalPages = dailySummaryPage(snapshot, 1).pagination.totalPages
+        const mirrorDaily = dailyMirrorRoot
+        const expectedViewNames = new Set(Array.from({ length: totalPages }, (_unused, index) => dailyMarkdownName(snapshot.date, index + 1)))
+        for (let page = 1; page <= totalPages; page += 1) {
+          const expectedMarkdown = renderDailySummary(dailySummaryPage(snapshot, page))
+          const viewName = dailyMarkdownName(snapshot.date, page)
+          const strictView = path.join(current.paths.daily, viewName)
+          if (readSecureVaultFile(current.paths, strictView) !== expectedMarkdown) errors.push(`Daily view ${viewName} is missing or does not match its sealed snapshot.`)
+          if (mirrorDaily) {
+            const mirrorView = path.join(mirrorDaily, viewName)
+            if (readSecureVaultFile(current.paths, mirrorView) !== expectedMarkdown) errors.push(`Record-layout daily mirror ${viewName} is missing or does not match its sealed snapshot.`)
+          }
+        }
+        secureVaultDirectory(current.paths, current.paths.daily)
+        for (const extra of dailyViewNames(current.paths.daily, snapshot.date).filter((name) => !expectedViewNames.has(name))) errors.push(`Daily view ${extra} is not declared by its sealed snapshot.`)
+        if (mirrorDaily && existsSync(mirrorDaily)) {
+          secureVaultDirectory(current.paths, mirrorDaily)
+          for (const extra of dailyViewNames(mirrorDaily, snapshot.date).filter((name) => !expectedViewNames.has(name))) errors.push(`Record-layout daily mirror ${extra} is not declared by its sealed snapshot.`)
+        }
+        dailySnapshots.push({ date: snapshot.date, snapshotHash: snapshot.snapshotHash, pageSize: snapshot.pageSize, pages: totalPages, valid: true })
+      } catch (error) {
+        dailySnapshots.push({ file: name, valid: false, error: error.code || 'DAILY_SNAPSHOT_INVALID' })
+        errors.push(`Daily snapshot ${name} is invalid: ${error.code || 'ERROR'} ${error.message}`)
+      }
+    }
+    secureVaultDirectory(current.paths, current.paths.daily)
+    for (const name of readdirSync(current.paths.daily)) {
+      const date = dailyViewDate(name)
+      if (date && !sealedDailyDates.has(date)) errors.push(`Daily view ${name} has no valid sealed JSON snapshot.`)
+    }
+  }
+  if (dailyMirrorRoot && existsSync(dailyMirrorRoot)) {
+    secureVaultDirectory(current.paths, dailyMirrorRoot)
+    for (const name of readdirSync(dailyMirrorRoot)) {
+      const date = dailyViewDate(name)
+      if (date && !sealedDailyDates.has(date)) errors.push(`Record-layout daily mirror ${name} has no valid sealed JSON snapshot.`)
+    }
+  }
   const acl = inspectVaultAcl(current.paths.vault)
   if (process.platform === 'win32' && !acl.enforced) errors.push(`Vault ACL is not enforced: ${acl.warning || acl.status}`)
   else if (process.platform !== 'win32' && !acl.enforced) warnings.push(`Vault ACL enforcement is degraded on this platform: ${acl.warning || acl.status}`)
@@ -2546,27 +3574,33 @@ export function verifyCommand(args) {
   }
   const mapFile = bundle.state.map?.manifest || null
   let map = null
-  if (!mapFile || !existsSync(mapFile)) {
+  if (!mapFile) {
     warnings.push('The referenced versioned map manifest is missing.')
   } else {
     try {
-      map = readJson(mapFile)
-      const mapPointer = existsSync(current.paths.mapPointer) ? readJson(current.paths.mapPointer) : null
+      secureVaultDirectory(current.paths, path.dirname(mapFile))
+      if (!existsSync(mapFile)) {
+        warnings.push('The referenced versioned map manifest is missing.')
+        throw Object.assign(new Error('Missing map manifest'), { code: 'MAP_MANIFEST_MISSING' })
+      }
+      map = JSON.parse(readSecureVaultFile(current.paths, mapFile))
+      const mapPointer = existsSync(current.paths.mapPointer) ? JSON.parse(readSecureVaultFile(current.paths, current.paths.mapPointer)) : null
       if (!mapPointer || mapPointer.versionId !== map.versionId || mapPointer.manifestSha256 !== sha256(stableJson(map))) errors.push('Map pointer does not match the versioned manifest.')
       for (const [key, fileName] of Object.entries(map.files || {})) {
         const artifact = path.join(path.dirname(mapFile), fileName)
         if (!isWithin(artifact, path.dirname(mapFile)) || !existsSync(artifact)) errors.push(`Versioned map artifact is missing or unsafe: ${key}`)
-        else if (map.artifactHashes?.[key] !== sha256File(artifact)) errors.push(`Versioned map artifact hash mismatch: ${key}`)
+        else if (map.artifactHashes?.[key] !== sha256(readSecureVaultFile(current.paths, artifact))) errors.push(`Versioned map artifact hash mismatch: ${key}`)
       }
       const versionedFileIndex = path.join(path.dirname(mapFile), map.files?.fileIndex || 'FILE_INDEX.md')
       if (existsSync(versionedFileIndex)) {
-        const currentFileIndex = existsSync(current.paths.fileIndex) ? readFileSync(current.paths.fileIndex, 'utf8') : ''
-        if (currentFileIndex !== readFileSync(versionedFileIndex, 'utf8')) errors.push('FILE_INDEX.md does not match the versioned map artifact.')
+        const currentFileIndex = existsSync(current.paths.fileIndex) ? readSecureVaultFile(current.paths, current.paths.fileIndex) : ''
+        if (currentFileIndex !== readSecureVaultFile(current.paths, versionedFileIndex)) errors.push('FILE_INDEX.md does not match the versioned map artifact.')
       }
       if (bundle.state.map?.inventoryFingerprint !== map.inventoryFingerprint) errors.push('State map reference does not match MAP_MANIFEST.json.')
       if (map.repo.head !== current.observation.head || map.repo.statusFingerprint !== current.observation.statusFingerprint) errors.push('Repository map is stale for the live worktree and must be refreshed.')
-    } catch {
-      errors.push('MAP_MANIFEST.json is invalid JSON.')
+    } catch (error) {
+      if (error.code === 'VAULT_PATH_UNSAFE') throw error
+      if (error.code !== 'MAP_MANIFEST_MISSING') errors.push('MAP_MANIFEST.json is invalid JSON.')
     }
   }
   const trust = classifyTrust(bundle, current.observation, current.paths)
@@ -2582,6 +3616,7 @@ export function verifyCommand(args) {
     generationChain: chain,
     runs: runChecks,
     evidence: evidenceCheck.checked,
+    dailySnapshots,
     vaultAcl: acl,
     map: map ? { inventoryFingerprint: map.inventoryFingerprint, head: map.repo.head, statusFingerprint: map.repo.statusFingerprint } : null,
     errors: unique(errors),
@@ -2631,6 +3666,9 @@ export const COMMANDS = {
   route: routeCommand,
   checkpoint: checkpointCommand,
   map: mapCommand,
+  profile: profileCommand,
+  daily: dailyCommand,
+  relink: relinkCommand,
   evidence: evidenceCommand,
   export: exportCommand,
   import: importCommand,
@@ -2639,11 +3677,11 @@ export const COMMANDS = {
   doctor: doctorCommand
 }
 
-const helpText = (command, purpose, requiredOptions, optionalOptions, exits) => `contextctl ${command} — ${purpose}\n\nUsage:\n  contextctl ${command} --repo <path> --vault <path>${requiredOptions.length ? ` ${requiredOptions.map((item) => item.split('  ')[0]).join(' ')}` : ''} [options]\n\nRequired for this operation:\n${requiredOptions.length ? requiredOptions.map((item) => `  ${item}`).join('\n') : '  None beyond --repo and --vault.'}\n\nImportant options:\n${optionalOptions.map((item) => `  ${item}`).join('\n')}\n\nExit behavior:\n${exits.map((item) => `  ${item}`).join('\n')}\n\nUnknown or omitted safety-critical options are never inferred.\n`
+const helpText = (command, purpose, requiredOptions, optionalOptions, exits) => `contextctl ${command} — ${purpose}\n\nUsage:\n  contextctl ${command} --repo <path> --store <path> --record-layout <vault|markdown|hybrid>${requiredOptions.length ? ` ${requiredOptions.map((item) => item.split('  ')[0]).join(' ')}` : ''} [options]\n\nRequired for this operation:\n${requiredOptions.length ? requiredOptions.map((item) => `  ${item}`).join('\n') : '  None beyond --repo, --store, and --record-layout.'}\n\nImportant options:\n${optionalOptions.map((item) => `  ${item}`).join('\n')}\n\nExit behavior:\n${exits.map((item) => `  ${item}`).join('\n')}\n\nUnknown or omitted safety-critical options are never inferred. Legacy --vault integrations may omit layout and retain the vault default.\n`
 
 export const COMMAND_HELP = {
   register: helpText('register', 'create first state, or refresh an existing state under its active session', [
-    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.',
+    '--store-confirmed-by-user  Required declaration that the current user selected this exact --store path for this session.',
     '--task <title>  Required for a managed first registration.',
     '--prd-path <file> --prd-approval <approved|user-approved|accepted>  Required when recording a PRD.'
   ], [
@@ -2653,7 +3691,7 @@ export const COMMAND_HELP = {
     'PRD revision reconciliation is deliberately refused here; use begin.'
   ], ['0 success.', '1 validation, identity, session, trust, or filesystem failure.']),
   begin: helpText('begin', 'create a new authenticated Agent run and return its bearer session token once', [
-    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.'
+    '--store-confirmed-by-user  Required declaration that the current user selected this exact --store path for this session.'
   ], [
     '--task and task contract fields  Required if no task is registered.',
     '--recover <run> --recovery-reason <text> --authority <text> --current-session-authority  Supersede an active run without rewriting it.',
@@ -2666,15 +3704,15 @@ export const COMMAND_HELP = {
     '--agent/--harness/--request/--next  Run metadata.'
   ], ['0 success; securely retain returned session token.', '1 any missing ownership, reconciliation, PRD, identity, or storage requirement.']),
   resume: helpText('resume', 'print a bounded Recovery Card without mutating state', [
-    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.'
+    '--store-confirmed-by-user  Required declaration that the current user selected this exact --store path for this session.'
   ], ['--json  Emit the complete bounded card as JSON.'], ['0 READY or initially UNMANAGED.', '3 STALE, CONFLICT, or BLOCKED.']),
   route: helpText('route', 'select or validate one deterministic route bound to live state', [
     '--event <comma-separated-signals>  Required; validation recomputes the mode from these signals.'
   ], [
     '--run <id> --session <token>  Required for an executable ordinary route.',
-    '--authority <reported-current-user-text> --current-session-authority  Recorded as history only; cannot enable a high-risk route.',
+    '--authority <reported-current-user-text> --current-session-authority  Records current-session provenance; host authorization remains external and is reported separately from protocol executable status.',
     '--validate <credential>  Authenticate and revalidate a prior HMAC credential.'
-  ], ['0 executable ordinary route/credential.', '3 trust is not READY.', '4 credential invalid/stale.', '5 standalone high-risk execution is disabled.', '6 no authenticated run.']),
+  ], ['0 route credential is current and recording-ready; high-risk host actions can still report executable=false.', '3 trust is not READY.', '4 credential invalid/stale.', '5 recording prerequisites such as current-session authority or sensitive-Git preflight are missing.', '6 no authenticated run.']),
   checkpoint: helpText('checkpoint', 'append one typed immutable event and update scoped state', [
     '--run <id> --session <token> --event <type> --summary <text>'
   ], [
@@ -2685,28 +3723,53 @@ export const COMMAND_HELP = {
     '--event-type <commit|push|deploy|rollback|acceptance|delete|export|import|model-access> --outcome <planned|started|succeeded|failed|partial|cancelled|blocked-unauthorized|unknown>  Typed lifecycle metadata.',
     'Observed successful commit/push events require exact --scope, before/after identity where applicable, and an internal live Git observer; optional attachments are supplementary only.',
     'A push observation additionally requires --allow-remote-observation, an exact --remote and full --ref, and the derived git-push/git-remote scope and environment shown on mismatch; its live OID must match --after-hash.',
-    'Standalone v1 rejects performed successes and observed succeeded deploy/rollback/acceptance/delete events; record failed, partial, blocked, or unknown instead.',
+    'The standalone recorder rejects unverified performed successes and observed succeeded deploy/rollback/acceptance/delete events; record failed, partial, blocked, or unknown instead.',
     '--hypothesis/--hypothesis-id/--hypothesis-status  Create or revise a stable hypothesis.',
     '--blocker/--resolve-blocker/--resolve-trust  Trust transitions are explicit.'
   ], ['0 event and state generation committed.', '1 invalid session, attribution, evidence, route, claim, or trust transition.']),
   map: helpText('map', 'refresh the deterministic versioned repository map', [
     '--run <id> --session <token>'
   ], ['Trust and live bindings must be READY/exact, except that an authenticated refresh may repair a sole stale-map snapshot after Git drift was already reconciled.'], ['0 map and state generation committed.', '1 non-map staleness, conflict, corruption, invalid session, or mapping failure.']),
+  profile: helpText('profile', 'read or refresh the bounded durable project introduction', [
+    '--store-confirmed-by-user  Required declaration that the current user selected this exact storage path.'
+  ], [
+    '--save --run <id> --session <token>  Refresh the profile as a derived state view.',
+    '--project-name/--project-summary/--project-purpose/--project-audience/--project-role  User-supplied descriptive fields.',
+    '--project-boundaries/--project-risks <csv>  Durable orientation boundaries; they do not change PRD semantics.'
+  ], ['0 profile returned or saved.', '1 identity, session, map, or storage validation failure.']),
+  daily: helpText('daily', 'derive one user-triggered development-day summary from immutable run records', [
+    '--store-confirmed-by-user  Required declaration that the current user selected this exact storage path.'
+  ], [
+    '--date <YYYY-MM-DD> --timezone <IANA-zone>  Date boundary; defaults to the current local day and system timezone.',
+    '--page <n> --page-size <1..10>  Deterministic event pagination; defaults to page 1 with 10 events. The first saved snapshot fixes the page size.',
+    '--save --run <id> --session <token>  Seal the first immutable daily JSON snapshot and regenerate every bounded Markdown page.',
+    '--live  Preview facts newer than an existing saved snapshot; cannot be combined with --save.',
+    'No scheduler is installed and no implemented/verified/pushed/deployed/accepted layer is inferred.'
+  ], ['0 summary previewed or saved.', '1 identity, date, timezone, session, or storage validation failure.']),
+  relink: helpText('relink', 'adopt transferred project history into a new workspace without copying active sessions', [
+    '--store-confirmed-by-user --project-id <id> --reason <text> --authority <current-user-text> --current-session-authority'
+  ], [
+    '--source-state-hash <sha256>  Select an exact source when the transferred store contains multiple contexts.',
+    '--allow-remote-change  Required when canonical remotes differ; never inferred.',
+    '--reharden-store-acl  On Windows, explicitly replace transferred ACL entries with the current SID, SYSTEM, and Administrators before adoption.',
+    '--record-layout <vault|markdown|hybrid>  Required with --store. Legacy --vault relink may preserve the source layout.',
+    'A new target generation is created. Old runs stay immutable/historical and revision-bound facts become stale.'
+  ], ['0 new workspace state created.', '1 missing source, identity conflict, unsafe remote change, ambiguity, or storage failure.']),
   evidence: helpText('evidence', 'copy one regular local file into the plaintext local vault', [
     '--run <id> --session <token> --file <path>'
   ], [
     '--label <text>  Human label.',
     '--kind <attachment|command-output|manifest|remote-ref|deployment-response|health-check|user-confirmation|api-response|log|test-report>  Typed evidence kind (default attachment).',
-    '--model-access  Disabled in standalone v1; local storage permission does not authorize model disclosure.'
+    '--model-access  Disabled in standalone recorder mode; local storage permission does not authorize model disclosure.'
   ], ['0 evidence hash and manifest recorded.', '1 unsafe file, drift, session, authority, or route failure.']),
-  export: helpText('export', 'reserved plaintext local transfer (disabled in standalone v1; never uploads)', [
+  export: helpText('export', 'reserved plaintext local transfer (disabled in standalone recorder mode; never uploads)', [
     '--run <id> --session <token> --destination <new-directory> --route-token <token> --authority <text> --current-session-authority --acknowledge-sensitive-export'
-  ], ['High-risk routes are non-executable in standalone v1.'], ['1 standalone authorization boundary, route, destination, integrity, or filesystem failure; no export is created.']),
-  import: helpText('import', 'reserved local archive import (disabled in standalone v1)', [
+  ], ['High-risk host actions remain external to the standalone recorder.'], ['1 standalone authorization boundary, route, destination, integrity, or filesystem failure; no export is created.']),
+  import: helpText('import', 'reserved local archive import (disabled in standalone recorder mode)', [
     '--run <id> --session <token> --source <export-directory> --route-token <token> --authority <text> --current-session-authority --acknowledge-untrusted-import'
-  ], ['High-risk routes are non-executable in standalone v1.'], ['1 standalone authorization boundary, route, identity, manifest, or integrity failure; no import is adopted.']),
+  ], ['High-risk host actions remain external to the standalone recorder.'], ['1 standalone authorization boundary, route, identity, manifest, or integrity failure; no import is adopted.']),
   verify: helpText('verify', 'validate generations, events, maps, derived views, live trust, and readiness', [
-    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.'
+    '--store-confirmed-by-user  Required declaration that the current user selected this exact --store path for this session.'
   ], [
     '--repair-views --run <id> --session <token>  Rebuild derived vault views; repair is a write and requires a current session.'
   ], ['0 integrity valid and trust READY.', '2 integrity failure or trust not READY.', '1 identity/state/argument failure.']),
@@ -2714,14 +3777,14 @@ export const COMMAND_HELP = {
     '--run <id> --session <token> --status <completed|partial|blocked> --summary <text>'
   ], ['--details <text> --next <text>  Handoff context. Live repository drift must be checkpointed first.'], ['0 run closed and state updated.', '1 session, drift, trust, or state failure.']),
   doctor: helpText('doctor', 'report protocol integrity, capture limitations, and local privacy posture', [
-    '--vault-confirmed-by-user  Required declaration that the current user selected this exact --vault path for this session.'
+    '--store-confirmed-by-user  Required declaration that the current user selected this exact --store path for this session.'
   ], ['The suite never uploads vault data; only an explicitly opted-in push observer may run read-only git ls-remote.'], ['0 report produced.', '1 repository/vault discovery failure.'])
 }
 
 export const HELP = `contextctl — local project context and run protocol
 
 Usage:
-  contextctl <command> --repo <path> --vault <path> [options]
+  contextctl <command> --repo <path> --store <path> [options]
 
 Commands:
   register    Create or refresh context state and deterministic project map.
@@ -2730,27 +3793,32 @@ Commands:
   route       Return one deterministic mode and a state-bound credential.
   checkpoint  Append a typed event and update scoped state.
   map         Refresh the deterministic architecture/file inventory.
+  profile     Read or refresh the durable project introduction.
+  daily       Preview or save a user-triggered daily development summary.
+  relink      Rebind transferred history to a new workspace/device safely.
   evidence    Copy a local evidence file into the vault and record its hash.
-  export      Reserved local transfer contract; disabled in standalone v1.
-  import      Reserved local import contract; disabled in standalone v1.
+  export      Reserved local transfer contract; disabled in standalone recorder mode.
+  import      Reserved local import contract; disabled in standalone recorder mode.
   verify      Validate machine generations, run events, maps, and derived views.
   finish      Close a run as completed, partial, or blocked.
   doctor      Report integrity, privacy, and capture capability/degradation.
 
 Common options:
   --repo <path>       Target Git worktree (default: current directory).
-  --vault <path>      Required explicit user-selected local vault outside every Git repository; there is no default.
-  --vault-confirmed-by-user  Required by resume/register/begin/verify/doctor after the current user selects the exact path; records a declaration, not cryptographic identity proof.
+  --store <path>      Required explicit user-selected context location outside every Git repository; there is no default. Legacy --vault remains accepted.
+  --store-confirmed-by-user  Required by resume/register/begin/profile/daily/verify/doctor after the current user selects the exact path. Legacy --vault-confirmed-by-user remains accepted.
+  --record-layout <vault|markdown|hybrid>  Required whenever --store is used. All layouts keep full machine history; markdown/hybrid add bounded human mirrors.
   --json              Emit JSON where a command also has a text view.
 
 Examples:
-  contextctl register --repo H:\\Project --vault <user-selected-absolute-path> --vault-confirmed-by-user --task "Fix upload" --requirement "Confirmed PRD section"
-  contextctl resume --repo H:\\Project --vault <user-selected-absolute-path> --vault-confirmed-by-user
-  contextctl begin --repo H:\\Project --vault <user-selected-absolute-path> --vault-confirmed-by-user --request "Current user request" --agent codex
-  contextctl route --repo H:\\Project --vault <user-selected-absolute-path> --run RUN-... --session SESSION-... --event diagnose
-  contextctl checkpoint --repo H:\\Project --vault <user-selected-absolute-path> --run RUN-... --session SESSION-... --event observation --summary "Observed failure" --fact "HTTP 413 only occurs at the proxy" --evidence EVID-...
-  contextctl verify --repo H:\\Project --vault <user-selected-absolute-path> --vault-confirmed-by-user
-  contextctl finish --repo H:\\Project --vault <user-selected-absolute-path> --run RUN-... --session SESSION-... --status partial --summary "Implementation complete; deployment not attempted" --next "Run mobile acceptance test"
+  contextctl register --repo H:\\Project --store <user-selected-absolute-path> --store-confirmed-by-user --record-layout hybrid --task "Fix upload" --requirement "Confirmed PRD section"
+  contextctl resume --repo H:\\Project --store <user-selected-absolute-path> --store-confirmed-by-user --record-layout hybrid
+  contextctl begin --repo H:\\Project --store <user-selected-absolute-path> --store-confirmed-by-user --record-layout hybrid --request "Current user request" --agent codex
+  contextctl route --repo H:\\Project --store <user-selected-absolute-path> --record-layout hybrid --run RUN-... --session SESSION-... --event diagnose
+  contextctl checkpoint --repo H:\\Project --store <user-selected-absolute-path> --record-layout hybrid --run RUN-... --session SESSION-... --event observation --summary "Observed failure" --fact "The proxy rejected the request" --evidence EVID-...
+  contextctl daily --repo H:\\Project --store <user-selected-absolute-path> --store-confirmed-by-user --record-layout hybrid --date 2026-08-10 --timezone Asia/Shanghai
+  contextctl verify --repo H:\\Project --store <user-selected-absolute-path> --store-confirmed-by-user --record-layout hybrid
+  contextctl finish --repo H:\\Project --store <user-selected-absolute-path> --record-layout hybrid --run RUN-... --session SESSION-... --status partial --summary "Implementation complete; deployment not attempted" --next "Run acceptance checks"
 
 Trust rules:
   Machine JSON is authoritative; Markdown is derived. Archived authorization is historical only.

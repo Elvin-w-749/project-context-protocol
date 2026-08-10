@@ -11,12 +11,7 @@ const SKILLS_DIR = path.join(ROOT, 'skills')
 const README_FILE = path.join(ROOT, 'README.md')
 const PACKAGE_FILE = path.join(ROOT, 'package.json')
 
-const EXPECTED_SKILLS = [
-  'diagnose-and-decide',
-  'project-context-protocol',
-  'release-with-provenance',
-  'verify-and-handoff'
-]
+const EXPECTED_SKILLS = ['project-context-protocol']
 
 const EXCLUDED_SOURCE_DIRECTORIES = new Set([
   '.git',
@@ -163,12 +158,12 @@ function validateSkillSet() {
     fail('skills/ directory is missing.')
     return
   }
-  const actual = listDirectories(SKILLS_DIR)
+  const actual = listDirectories(SKILLS_DIR).filter((name) => existsSync(path.join(SKILLS_DIR, name, 'SKILL.md')))
   if (JSON.stringify(actual) !== JSON.stringify(EXPECTED_SKILLS)) {
     fail(`skills/ must contain exactly ${EXPECTED_SKILLS.join(', ')}; found ${actual.length ? actual.join(', ') : '(none)'}.`)
     return
   }
-  recordCheck('exact four-Skill inventory')
+  recordCheck('exact single-entry Skill inventory')
 }
 
 function validateSkillMetadata(skillName) {
@@ -210,8 +205,8 @@ function validateSkillMetadata(skillName) {
         fail(`${relative(agentFile)} default_prompt must contain $${skillName}.`)
       } else if (skillName === 'project-context-protocol') {
         const value = String(prompt.value)
-        if (!/ask me[\s\S]*Vault/i.test(value) || !/explicit absolute path/i.test(value)) {
-          fail(`${relative(agentFile)} default_prompt must ask the current user for an explicit absolute Vault path before recovery.`)
+        if (!/ask me[\s\S]*storage path/i.test(value) || !/explicit absolute/i.test(value) || !/vault, markdown, or hybrid/i.test(value)) {
+          fail(`${relative(agentFile)} default_prompt must ask the current user for an explicit absolute storage path and record layout before recovery.`)
         }
       }
 
@@ -308,58 +303,38 @@ function requireDocumentContract(file, checksForFile) {
 }
 
 function validateDocumentationContracts() {
-  for (const skillName of EXPECTED_SKILLS) {
-    const file = path.join(SKILLS_DIR, skillName, 'SKILL.md')
-    requireDocumentContract(file, [
-      ['v1 CLI-help heading', /^## CLI help contract \(v1\)$/m],
-      ['global contextctl help', /`contextctl --help`[^\n]*(?:inventory|command)/i],
-      ['per-command option help', /`contextctl <command> --help`[^\n]*(?:required|safety|exit)/i],
-      ['fail-closed unknown-option behavior', /(?:stop|fail closed)[^\n]*(?:invent|guess)[^\n]*(?:flag|option)/i]
-    ])
-  }
-
-  requireDocumentContract(README_FILE, [
-    ['non-Git v1 support boundary', /Version 1 requires[^\n]*Git worktree/i],
-    ['non-Git BLOCKED state', /non-Git[^\n]*`BLOCKED`/i],
-    ['degraded and unmanaged manual fallback', /degraded\/unmanaged/i]
-  ])
-
   const coreSkill = path.join(SKILLS_DIR, 'project-context-protocol', 'SKILL.md')
   requireDocumentContract(coreSkill, [
-    ['non-Git v1 support boundary', /Version 1 supports Git worktrees only/i],
-    ['non-Git BLOCKED state', /non-Git[^\n]*`BLOCKED`/i],
-    ['degraded and unmanaged manual fallback', /degraded\/unmanaged/i],
-    ['pre-access current-user Vault question', /Before any Vault command or Vault read[\s\S]{0,500}?ask one concise question[\s\S]{0,200}?pause/i],
-    ['no default or inferred Vault location', /There is no default Vault location/i],
-    ['current-session Vault confirmation flag', /--vault-confirmed-by-user/]
+    ['pre-access current-user storage question', /Before any context-store read or write[\s\S]{0,400}?ask the current user/i],
+    ['explicit record-layout choice', /`vault`, `markdown`, or `hybrid`/i],
+    ['no inferred location or layout', /Never infer a path or layout/i],
+    ['single-Skill entry contract', /Use this single Skill as the project entry point/i],
+    ['stable project relink contract', /contextctl relink/i],
+    ['user-triggered daily summary', /There is no scheduler[\s\S]{0,300}?contextctl daily/i],
+    ['model method freedom', /free to choose its diagnosis, implementation, verification, tools, file order, and Agent topology/i],
+    ['claim-layer separation', /implemented[^\n]*verified[^\n]*committed[^\n]*pushed[^\n]*deployed[^\n]*accepted/i]
   ])
 
   const stateContract = path.join(SKILLS_DIR, 'project-context-protocol', 'references', 'state-contract.md')
   requireDocumentContract(stateContract, [
-    ['non-Git v1 state boundary', /Version 1 requires a Git worktree/i],
-    ['non-Git BLOCKED state', /non-Git[^\n]*`BLOCKED`/i],
-    ['degraded and unmanaged manual fallback', /degraded\/unmanaged/i]
+    ['machine authority contract', /generation JSON as the machine authority|machine JSON/i],
+    ['separate completion layers', /analyzed[\s\S]*implemented[\s\S]*verified[\s\S]*committed[\s\S]*pushed[\s\S]*deployed[\s\S]*accepted/i]
   ])
 
-  const eventContract = path.join(SKILLS_DIR, 'release-with-provenance', 'references', 'event-contract.md')
-  const eventRaw = readUtf8(eventContract)
-  if (eventRaw !== null) {
-    const importRow = eventRaw.match(/^\|\s*`import`\s*\|([^\n]+)$/m)
-    if (!importRow) {
-      fail(`${relative(eventContract)} must include an import row in Required evidence by type.`)
-    } else {
-      const row = importRow[1]
-      for (const [label, pattern] of [
-        ['source manifest evidence', /manifest/i],
-        ['quarantine destination evidence', /quarantine/i],
-        ['explicit non-adoption evidence', /adoptedAsCurrentState:\s*false/i]
-      ]) {
-        if (!pattern.test(row)) fail(`${relative(eventContract)} import evidence row is missing ${label}.`)
-      }
-    }
-  }
+  const eventContract = path.join(SKILLS_DIR, 'project-context-protocol', 'references', 'release-and-provenance.md')
+  requireDocumentContract(eventContract, [
+    ['external execution authority boundary', /execution authority comes from the current user and the host platform/i],
+    ['independent lifecycle outcomes', /Never infer push from commit, deployment from push, or acceptance from deployment/i]
+  ])
 
-  recordCheck('v1 CLI-help, non-Git, and import-evidence documentation contracts')
+  requireDocumentContract(README_FILE, [
+    ['single-entry Skill', /one entry Skill|一个入口 Skill/i],
+    ['three record layouts', /vault[\s\S]*markdown[\s\S]*hybrid/i],
+    ['daily summary command', /contextctl daily/i],
+    ['relink command', /contextctl relink/i]
+  ])
+
+  recordCheck('v2 single-entry, layout, relink, daily, and evidence-layer documentation contracts')
 }
 
 function normalizePackageBins(packageJson) {
@@ -393,10 +368,10 @@ async function validatePackageAndCli() {
   const expectedBins = ['context-adapter', 'contextctl']
   const actualBins = Object.keys(bins).sort()
   if (JSON.stringify(actualBins) !== JSON.stringify(expectedBins)) {
-    fail(`Standalone v1 must expose exactly ${expectedBins.join(', ')}; found ${actualBins.join(', ') || 'none'}.`)
+    fail(`The standalone recorder must expose exactly ${expectedBins.join(', ')}; found ${actualBins.join(', ') || 'none'}.`)
   }
   const forbiddenExecutor = path.join(SKILLS_DIR, 'project-context-protocol', 'scripts', 'context-release-executor.mjs')
-  if (existsSync(forbiddenExecutor)) fail('Standalone v1 must not ship context-release-executor.mjs.')
+  if (existsSync(forbiddenExecutor)) fail('The standalone recorder must not ship context-release-executor.mjs.')
 
   let primaryCli = null
   for (const [name, target] of Object.entries(bins)) {
@@ -421,19 +396,19 @@ async function validatePackageAndCli() {
 
   const commandsFile = path.join(SKILLS_DIR, 'project-context-protocol', 'scripts', 'lib', 'commands.mjs')
   const commandsSource = readUtf8(commandsFile) || ''
-  if (!/function\s+externalApprovalStatus\s*\([^)]*\)\s*\{[\s\S]{0,300}?valid:\s*false/.test(commandsSource)) {
-    fail('Standalone v1 commands must keep externalApprovalStatus fail-closed.')
+  if (!/function\s+externalApprovalStatus\s*\([^)]*\)\s*\{[\s\S]{0,400}?evaluatedByProtocol:\s*false[\s\S]{0,400}?authority:\s*'external-to-protocol'/.test(commandsSource)) {
+    fail('Standalone recorder routes must report external host authority without pretending to approve or deny it.')
   }
-  if (!/Standalone v1 never makes a high-risk route executable/.test(commandsSource)) {
-    fail('Standalone v1 commands must state the non-executable high-risk route contract.')
+  if (!/protocolExecutesAction:\s*false/.test(commandsSource) || !/executionAuthority:\s*'external-to-protocol'/.test(commandsSource)) {
+    fail('Routes must state that the protocol does not execute host actions and that execution authority remains external.')
   }
   const adapterFile = path.join(SKILLS_DIR, 'project-context-protocol', 'scripts', 'context-adapter.mjs')
   const adapterSource = readUtf8(adapterFile) || ''
   if (/from\s+['"]node:child_process['"]|\bspawn(?:Sync)?\s*\(/.test(adapterSource)) {
-    fail('Standalone v1 context-adapter must not spawn arbitrary child programs.')
+    fail('The standalone context-adapter must not spawn arbitrary child programs.')
   }
   if (!/STANDALONE_CHILD_EXECUTION_DISABLED/.test(adapterSource)) {
-    fail('Standalone v1 context-adapter must fail closed when launch is requested.')
+    fail('The standalone context-adapter must fail closed when launch is requested.')
   }
   let commandNames = []
   try {
@@ -478,7 +453,7 @@ async function validatePackageAndCli() {
     }
     const output = help.stdout || ''
     if (binName === 'context-adapter' && /\bcontext-adapter\s+launch\b/i.test(output)) {
-      fail('context-adapter help must not expose an arbitrary child-process launcher in standalone v1.')
+      fail('context-adapter help must not expose an arbitrary child-process launcher in standalone recorder mode.')
     }
     for (const command of claimed) {
       if (!new RegExp(`\\b${binName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} ${command}\\b`, 'i').test(output)) {

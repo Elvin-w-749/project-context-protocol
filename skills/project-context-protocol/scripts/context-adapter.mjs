@@ -1,26 +1,26 @@
 #!/usr/bin/env node
 
-import { COMMANDS } from './lib/commands.mjs'
+import { COMMANDS, validateRouteSignals } from './lib/commands.mjs'
 import { assert, parseArgs, stableJson } from './lib/util.mjs'
 
-const ADAPTER_VERSION = 'project-context/lifecycle-adapter/v1'
+const ADAPTER_VERSION = 'project-context/lifecycle-adapter/v2'
 
 const HELP = `context-adapter — explicit Agent/Harness lifecycle adapter
 
 Usage:
-  context-adapter session-start --repo <path> --vault <user-selected-absolute-path> --vault-confirmed-by-user [--task <title>] [contextctl begin options]
-  context-adapter heartbeat --repo <path> --vault <path> --run <id> --session <token> [--summary <text>]
-  context-adapter checkpoint --repo <path> --vault <path> --run <id> --session <token> --event <type> --summary <text> [checkpoint options]
-  context-adapter session-stop --repo <path> --vault <path> --run <id> --session <token> [--status partial|blocked|completed] [--summary <text>]
+  context-adapter session-start --repo <path> --store <user-selected-absolute-path> --store-confirmed-by-user --record-layout <vault|markdown|hybrid> [--task <title>] [contextctl begin options]
+  context-adapter heartbeat --repo <path> --store <path> --record-layout <layout> --run <id> --session <token> [--summary <text>]
+  context-adapter checkpoint --repo <path> --store <path> --record-layout <layout> --run <id> --session <token> --event <type> --summary <text> [checkpoint options]
+  context-adapter session-stop --repo <path> --store <path> --record-layout <layout> --run <id> --session <token> [--status partial|blocked|completed] [--summary <text>]
 
 Lifecycle guarantees:
-  Before session-start, the caller must ask the current user where to open or store the Vault.
-  There is no inferred location; missing current-session confirmation stops before any Vault read or write.
+  Before session-start, the caller must ask the current user for the context-store path and record layout.
+  There is no inferred selection; missing current-session confirmation stops before any store read or write.
   session-start restores state, registers only when --task is supplied for an unmanaged repository,
   begins a fresh authenticated run, routes one mode, and returns a bounded Recovery Card.
   heartbeat is an authenticated observation checkpoint and renews the run lease.
   session-stop writes a handoff checkpoint and closes partial by default; it never infers completion.
-  Standalone v1 never launches child programs; an external Harness owns execution.
+  The standalone adapter never launches child programs; an external Harness owns execution.
 
 Capture boundary:
   Without --hook-mediated, output is explicitly marked degraded-no-installed-hook even when the
@@ -56,20 +56,30 @@ function requireRunSession(args) {
 }
 
 function requireCurrentSessionVault(args) {
+  const selected = args.store !== undefined ? args.store : args.vault
   assert(
-    args.vault !== undefined && args.vault !== true && String(args.vault).trim() !== '',
-    '--vault is required. Ask the current user where this session may open or store the local Vault.',
+    selected !== undefined && selected !== true && String(selected).trim() !== '',
+    '--store (or legacy --vault) is required. Ask the current user where this session may open or store project context.',
     'VAULT_LOCATION_REQUIRED'
   )
   assert(
-    args['vault-confirmed-by-user'] === true,
-    'session-start requires --vault-confirmed-by-user after the current user explicitly selects the exact Vault path',
+    args['store-confirmed-by-user'] === true || args['vault-confirmed-by-user'] === true,
+    'session-start requires --store-confirmed-by-user after the current user explicitly selects the exact context path',
     'VAULT_LOCATION_CONFIRMATION_REQUIRED'
   )
+  if (args.store !== undefined) {
+    assert(
+      args['record-layout'] !== undefined && args['record-layout'] !== true && String(args['record-layout']).trim() !== '',
+      'session-start requires --record-layout vault, markdown, or hybrid whenever --store is used',
+      'RECORD_LAYOUT_REQUIRED'
+    )
+  }
 }
 
 export function sessionStart(args, source = 'lifecycle-command') {
   requireCurrentSessionVault(args)
+  const routeEvent = args['route-event'] === undefined ? 'session-start' : String(args['route-event'] === true ? '' : args['route-event'])
+  validateRouteSignals([routeEvent])
   const capture = captureDeclaration(args, source)
   const base = contextArgs(args)
   let restored = COMMANDS.resume({ ...base, json: true })
@@ -84,21 +94,25 @@ export function sessionStart(args, source = 'lifecycle-command') {
         exitCode: 3
       }
     }
-    COMMANDS.register(base)
-    restored = COMMANDS.resume({ ...base, json: true })
+    // `begin --task` is the single adoption path for both a brand-new store and
+    // a persisted UNMANAGED registration. Calling register here would require
+    // a run that cannot exist yet and made cold start impossible.
   }
   const begun = COMMANDS.begin({
     ...base,
     harness: capture.degraded ? 'context-adapter/manual-lifecycle' : 'context-adapter/lifecycle-hook',
     coverage: capture.coverage
   })
-  const routeEvent = args['route-event'] && args['route-event'] !== true ? String(args['route-event']) : 'session-start'
   const routed = COMMANDS.route({
     repo: base.repo,
     vault: base.vault,
+    store: base.store,
+    'record-layout': base['record-layout'],
     run: begun.runId,
     session: begun.session,
-    event: routeEvent
+    event: routeEvent,
+    authority: base.authority,
+    'current-session-authority': base['current-session-authority']
   })
   const recovery = COMMANDS.resume({ ...base, json: true }).card
   return {
@@ -110,7 +124,7 @@ export function sessionStart(args, source = 'lifecycle-command') {
     session: begun.session,
     run: begun.run,
     route: routed,
-    exitCode: routed.executable ? 0 : routed.exitCode
+    exitCode: routed.recordingReady ? 0 : routed.exitCode
   }
 }
 
@@ -120,6 +134,8 @@ export function heartbeat(args, source = 'lifecycle-command') {
   const checkpoint = COMMANDS.checkpoint({
     repo: args.repo,
     vault: args.vault,
+    store: args.store,
+    'record-layout': args['record-layout'],
     run: args.run,
     session: args.session,
     'lease-seconds': args['lease-seconds'],
@@ -145,10 +161,11 @@ export function lifecycleCheckpoint(args, source = 'lifecycle-command') {
 
 export function sessionStop(args, source = 'lifecycle-command') {
   requireRunSession(args)
-  const capture = captureDeclaration(args, source)
   const status = args.status && args.status !== true ? String(args.status) : args['stop-status'] && args['stop-status'] !== true ? String(args['stop-status']) : 'partial'
+  assert(new Set(['completed', 'partial', 'blocked']).has(status), `Unsupported session-stop status ${status}`, 'RUN_STATUS_INVALID')
   const explicitSummary = args.summary && args.summary !== true ? String(args.summary) : null
   assert(status !== 'completed' || explicitSummary, 'A completed session-stop requires an explicit --summary; completion is never inferred', 'ADAPTER_COMPLETION_NOT_INFERRED')
+  const capture = captureDeclaration(args, source)
   const summary = explicitSummary || 'Session stopped with partial status; task completion was not inferred.'
   const base = contextArgs(args, ['status', 'summary', 'details', 'next'])
   const handoff = COMMANDS.checkpoint({
@@ -162,6 +179,8 @@ export function sessionStop(args, source = 'lifecycle-command') {
   const finished = COMMANDS.finish({
     repo: args.repo,
     vault: args.vault,
+    store: args.store,
+    'record-layout': args['record-layout'],
     run: args.run,
     session: args.session,
     status,
@@ -179,7 +198,7 @@ function heartbeatInterval(args) {
 }
 
 export async function launch() {
-  const error = new Error('Standalone v1 never launches child programs. Use an external Harness and record only independently observed results.')
+  const error = new Error('The standalone adapter never launches child programs. Use an external Harness and record only independently observed results.')
   error.code = 'STANDALONE_CHILD_EXECUTION_DISABLED'
   throw error
 }

@@ -4,6 +4,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { canonicalPath, sha256, sha256File } from './util.mjs'
 
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
 function sanitizedGitEnvironment() {
   const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' }
   for (const key of [
@@ -108,7 +112,7 @@ export function normalizeRemote(remote) {
 
 function workingPathFingerprint(root, relativePaths) {
   const entries = []
-  for (const relative of [...new Set(relativePaths)].sort((a, b) => a.localeCompare(b))) {
+  for (const relative of [...new Set(relativePaths)].sort(compareText)) {
     const absolute = path.join(root, relative)
     try {
       const stats = lstatSync(absolute)
@@ -144,7 +148,7 @@ export function discoverRepository(inputPath) {
   const modified = splitNull(git(root, ['diff', '--name-only', '-z'], { trim: false }))
   const staged = splitNull(git(root, ['diff', '--cached', '--name-only', '-z'], { trim: false }))
   const untracked = splitNull(git(root, ['ls-files', '--others', '--exclude-standard', '-z'], { trim: false }))
-  const changedPaths = [...new Set([...modified, ...staged, ...untracked])].sort((a, b) => a.localeCompare(b))
+  const changedPaths = [...new Set([...modified, ...staged, ...untracked])].sort(compareText)
   const contentFingerprint = workingPathFingerprint(root, changedPaths)
   const statusFingerprint = sha256(`${status}\0${indexManifest}\0${contentFingerprint}`)
   const repoBasis = canonicalRemote || `local:${gitCommonDir}`
@@ -183,7 +187,7 @@ export function listRepositoryFiles(repo) {
   return {
     tracked,
     untracked: others,
-    all: [...new Set([...tracked, ...others])].sort((a, b) => a.localeCompare(b))
+    all: [...new Set([...tracked, ...others])].sort(compareText)
   }
 }
 

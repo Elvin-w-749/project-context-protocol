@@ -1,6 +1,6 @@
 interface:
   display_name: "Project Context Protocol"
-  short_description: "Ask for the Vault, recover state, and record every run"
-  default_prompt: "Use $project-context-protocol. Before reading or writing project context, ask me where this session should open or store the local Vault and wait for an explicit absolute path. Then resume the repository and start a traceable run with that exact path."
+  short_description: "Cold-start, route, record, and hand off any project"
+  default_prompt: "Use $project-context-protocol before other project work. First ask me for an explicit absolute project-context storage path and one layout (vault, markdown, or hybrid), and wait if either is missing. Then recover the bounded Project Profile and Recovery Card, begin a traceable run, and preserve an evidence-backed handoff without prescribing the solution method."
 policy:
   allow_implicit_invocation: true

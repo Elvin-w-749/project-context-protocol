@@ -17,6 +17,8 @@ import { fileURLToPath } from 'node:url'
 
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url))
 export const PROJECT_ROOT = path.dirname(TESTS_DIR)
+const configuredChildTimeout = Number.parseInt(process.env.CONTEXT_PROTOCOL_TEST_CHILD_TIMEOUT_MS || '120000', 10)
+const CHILD_TIMEOUT_MS = Number.isInteger(configuredChildTimeout) && configuredChildTimeout > 0 ? configuredChildTimeout : 120000
 export const CLI = path.join(
   PROJECT_ROOT,
   'skills',
@@ -83,6 +85,7 @@ export function run(program, args, options = {}) {
     encoding: options.encoding ?? 'utf8',
     env: processEnvironment(),
     windowsHide: true,
+    timeout: options.timeout ?? CHILD_TIMEOUT_MS,
     maxBuffer: 128 * 1024 * 1024,
     stdio: options.stdio ?? ['ignore', 'pipe', 'pipe']
   })
@@ -120,6 +123,7 @@ export function cli(command, options = {}) {
     encoding: 'utf8',
     env: processEnvironment(),
     windowsHide: true,
+    timeout: options.timeout ?? CHILD_TIMEOUT_MS,
     maxBuffer: 128 * 1024 * 1024
   })
   if (result.error) throw result.error
@@ -154,8 +158,24 @@ export function cliAsync(command, options = {}) {
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (chunk) => { stdout += chunk })
     child.stderr.on('data', (chunk) => { stderr += chunk })
-    child.on('error', reject)
+    let settled = false
+    const timeoutMs = options.timeout ?? CHILD_TIMEOUT_MS
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      child.kill()
+      reject(Object.assign(new Error(`contextctl ${command} exceeded the ${timeoutMs}ms test child timeout`), { code: 'TEST_CHILD_TIMEOUT' }))
+    }, timeoutMs)
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    })
     child.on('close', (status, signal) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
       const json = parseEmbeddedJson(stdout) || parseEmbeddedJson(stderr)
       resolve({ status, signal, stdout, stderr, json, command, argv: args.slice(1) })
     })

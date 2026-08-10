@@ -1,6 +1,0 @@
-interface:
-  display_name: "Verify and Handoff"
-  short_description: "Verify scoped claims and leave a recoverable handoff"
-  default_prompt: "Use $verify-and-handoff to validate current claims and prepare the next handoff."
-policy:
-  allow_implicit_invocation: false

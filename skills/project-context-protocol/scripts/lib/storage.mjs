@@ -1,4 +1,4 @@
-import { existsSync, openSync, closeSync, fsyncSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, openSync, closeSync, fsyncSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
@@ -10,6 +10,7 @@ import {
   atomicWrite,
   canonicalPath,
   ensureDir,
+  isLexicallyWithin,
   isWithin,
   inlineMarkdown,
   markdownList,
@@ -18,6 +19,7 @@ import {
   randomId,
   randomSecret,
   readJson,
+  redactSensitiveText,
   recoverAtomicTarget,
   sha256,
   stableJson,
@@ -33,6 +35,7 @@ const VAULT_ACL_PROTOCOL = 'project-context/vault-acl/v1'
 const DEFAULT_RUN_LEASE_SECONDS = 15 * 60
 const MIN_RUN_LEASE_SECONDS = 5
 const MAX_RUN_LEASE_SECONDS = 24 * 60 * 60
+const STATE_SCHEMA_VERSION = 2
 const LOCK_INITIALIZATION_RETRY_DELAYS_MS = Object.freeze([2, 4, 8, 16, 32, 50])
 const LOCK_INITIALIZATION_WAIT = new Int32Array(new SharedArrayBuffer(4))
 
@@ -216,6 +219,22 @@ function enforceVaultAcl(paths, rootExisted, priorEntries) {
   return inspected
 }
 
+export function rehardenVaultAcl(paths) {
+  assert(existsSync(paths.vault), `Context store does not exist: ${paths.vault}`, 'VAULT_NOT_FOUND')
+  if (process.platform !== 'win32') return inspectVaultAcl(paths.vault)
+  try {
+    hardenWindowsVaultAcl(paths.vault)
+  } catch (error) {
+    const wrapped = new Error(`Failed to re-harden the transferred context-store ACL: ${error.message}`)
+    wrapped.code = 'VAULT_ACL_HARDENING_FAILED'
+    throw wrapped
+  }
+  const inspected = inspectVaultAcl(paths.vault)
+  assert(inspected.enforced, `Transferred context-store ACL is not safely enforced (${inspected.status})`, 'VAULT_ACL_UNSAFE')
+  writeJsonAtomic(paths.vaultAcl, { ...inspected, checkedAt: nowIso(), migratedForCurrentDevice: true })
+  return inspected
+}
+
 function waitForLockInitialization(milliseconds) {
   Atomics.wait(LOCK_INITIALIZATION_WAIT, 0, 0, milliseconds)
 }
@@ -346,6 +365,7 @@ export function vaultPaths(vaultInput, observation) {
     vault,
     protocolKey: path.join(vault, '.protocol-key'),
     vaultAcl: path.join(vault, '.vault-acl.json'),
+    vaultLocks: path.join(vault, '.locks'),
     registry: path.join(vault, 'registry.json'),
     repository,
     repositoryMetadata: path.join(repository, 'repository.json'),
@@ -355,6 +375,7 @@ export function vaultPaths(vaultInput, observation) {
     generations: path.join(context, 'state', 'generations'),
     currentPointer: path.join(context, 'state', 'current.json'),
     projectContext: path.join(context, 'PROJECT_CONTEXT.md'),
+    projectProfile: path.join(context, 'PROJECT_PROFILE.md'),
     architecture: path.join(context, 'ARCHITECTURE.md'),
     fileIndex: path.join(context, 'FILE_INDEX.md'),
     maps: path.join(context, 'maps'),
@@ -365,9 +386,64 @@ export function vaultPaths(vaultInput, observation) {
     runs: path.join(context, 'runs'),
     events: path.join(context, 'events'),
     evidence: path.join(context, 'evidence'),
+    daily: path.join(context, 'daily'),
+    markdownContext: path.join(vault, 'records', observation.repoId, observation.workspaceId, observation.contextId),
+    portableContext: path.join(vault, 'portable', observation.repoId, observation.workspaceId, observation.contextId),
     imports: path.join(context, 'imports'),
     locks: path.join(context, 'locks')
   }
+}
+
+function isResolvedWithin(candidate, root) {
+  const relative = path.relative(root, candidate)
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
+}
+
+export function secureVaultDirectory(paths, directory, { create = false } = {}) {
+  const vault = path.resolve(paths.vault)
+  const target = path.resolve(directory)
+  const lexicalRelative = path.relative(vault, target)
+  assert(lexicalRelative === '' || (!path.isAbsolute(lexicalRelative) && lexicalRelative !== '..' && !lexicalRelative.startsWith(`..${path.sep}`)), `Vault path resolves lexically outside the selected store: ${directory}`, 'VAULT_PATH_UNSAFE')
+  assert(existsSync(vault), 'Selected context store does not exist', 'VAULT_PATH_UNSAFE')
+  const vaultStats = lstatSync(vault)
+  assert(vaultStats.isDirectory() && !vaultStats.isSymbolicLink(), 'Selected context store must be a real directory, not a link or junction', 'VAULT_PATH_UNSAFE')
+  const resolvedVault = realpathSync.native(vault)
+  let cursor = vault
+  for (const segment of lexicalRelative.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, segment)
+    if (!existsSync(cursor)) {
+      assert(create, `Vault directory is missing: ${cursor}`, 'VAULT_PATH_UNSAFE')
+      ensureDir(cursor)
+    }
+    const stats = lstatSync(cursor)
+    assert(stats.isDirectory() && !stats.isSymbolicLink(), `Vault directory must not be a link or junction: ${cursor}`, 'VAULT_PATH_UNSAFE')
+    assert(isResolvedWithin(realpathSync.native(cursor), resolvedVault), `Vault directory resolves outside the selected store: ${cursor}`, 'VAULT_PATH_UNSAFE')
+  }
+  return target
+}
+
+export function readSecureVaultFile(paths, file) {
+  if (!existsSync(file)) return null
+  secureVaultDirectory(paths, path.dirname(file))
+  const stats = lstatSync(file)
+  assert(stats.isFile() && !stats.isSymbolicLink(), `Vault view must be a regular file, not a link: ${file}`, 'VAULT_PATH_UNSAFE')
+  const resolvedVault = realpathSync.native(paths.vault)
+  const resolved = realpathSync.native(file)
+  assert(isResolvedWithin(resolved, resolvedVault), `Vault view resolves outside the selected store: ${file}`, 'VAULT_PATH_UNSAFE')
+  return readFileSync(resolved, 'utf8')
+}
+
+function coreVaultDirectories(paths) {
+  return [paths.vaultLocks, paths.repository, paths.workspace, paths.context, paths.state, paths.generations, paths.trees, paths.maps, paths.runs, paths.events, paths.evidence, paths.daily, paths.imports, paths.locks]
+}
+
+export function validateVaultStructure(paths, { create = false } = {}) {
+  if (!existsSync(paths.vault)) return false
+  secureVaultDirectory(paths, paths.vault)
+  for (const directory of coreVaultDirectories(paths)) {
+    if (create || existsSync(directory)) secureVaultDirectory(paths, directory, { create })
+  }
+  return true
 }
 
 export function ensureVault(paths, observation) {
@@ -376,9 +452,7 @@ export function ensureVault(paths, observation) {
   const priorEntries = rootExisted ? readdirSync(paths.vault) : []
   ensureDir(paths.vault)
   enforceVaultAcl(paths, rootExisted, priorEntries)
-  for (const directory of [paths.repository, paths.workspace, paths.context, paths.state, paths.generations, paths.trees, paths.maps, paths.runs, paths.events, paths.evidence, paths.imports, paths.locks]) {
-    ensureDir(directory)
-  }
+  validateVaultStructure(paths, { create: true })
   if (!existsSync(paths.protocolKey)) {
     assert(!initializedVault, 'An initialized vault is missing its protocol signing key; explicit recovery or a fresh vault is required', 'PROTOCOL_KEY_MISSING')
     try {
@@ -389,7 +463,8 @@ export function ensureVault(paths, observation) {
   }
   const protocolKey = readFileSync(paths.protocolKey, 'utf8').trim()
   assert(/^[a-f0-9]{64}$/.test(protocolKey), 'Vault protocol signing key is missing or invalid', 'PROTOCOL_KEY_INVALID')
-  withOwnedLockFile(path.join(paths.vault, '.locks', 'registry.lock'), () => {
+  secureVaultDirectory(paths, paths.vaultLocks, { create: true })
+  withOwnedLockFile(path.join(paths.vaultLocks, 'registry.lock'), () => {
     const registry = existsSync(paths.registry) ? readJson(paths.registry) : { protocol: PROTOCOL_VERSION, repositories: {} }
     const prior = registry.repositories[observation.repoId] || { workspaces: {} }
     registry.repositories[observation.repoId] = {
@@ -416,10 +491,11 @@ export function ensureVault(paths, observation) {
 export function initialState(observation, options = {}) {
   return {
     protocol: PROTOCOL_VERSION,
-    schemaVersion: 1,
+    schemaVersion: STATE_SCHEMA_VERSION,
     generation: 0,
     parentGenerationHash: null,
     repo: {
+      projectId: options.projectId || `project-${sha256(observation.canonicalRemote || observation.repoId).slice(0, 20)}`,
       repoId: observation.repoId,
       workspaceId: observation.workspaceId,
       contextId: observation.contextId,
@@ -431,6 +507,9 @@ export function initialState(observation, options = {}) {
     observation: compactObservation(observation),
     trust: { status: options.task ? 'READY' : 'UNMANAGED', reasons: options.task ? [] : ['No active task has been recorded.'] },
     stage: 'registered',
+    recordLayout: options.recordLayout || 'vault',
+    profile: options.profile || null,
+    relinkHistory: [],
     task: options.task ? {
       id: options.taskId || randomId('TASK'),
       title: options.task,
@@ -495,20 +574,40 @@ export function saveRunRecord(runFile, run, { exclusive = false } = {}) {
 }
 
 export function loadState(paths) {
+  if (!validateVaultStructure(paths)) return null
+  if (!existsSync(paths.state)) return null
+  secureVaultDirectory(paths, paths.state)
   recoverAtomicTarget(paths.currentPointer)
   if (!existsSync(paths.currentPointer)) return null
-  const pointer = readJson(paths.currentPointer)
+  const pointer = JSON.parse(readSecureVaultFile(paths, paths.currentPointer))
   assert(pointer.protocol === PROTOCOL_VERSION, 'Current pointer protocol is invalid', 'STATE_POINTER_INVALID')
   assert(/^generation-\d{8}(?:-[a-f0-9]{12})?\.json$/.test(String(pointer.file || '')), 'Current pointer contains an unsafe generation filename', 'STATE_POINTER_INVALID')
   const generationFile = path.join(paths.generations, pointer.file)
   assert(isWithin(generationFile, paths.generations), 'State generation path escapes the vault', 'STATE_POINTER_INVALID')
   assert(existsSync(generationFile), `Missing state generation ${pointer.file}`, 'STATE_GENERATION_MISSING')
-  const raw = readFileSync(generationFile, 'utf8')
+  secureVaultDirectory(paths, paths.generations)
+  const raw = readSecureVaultFile(paths, generationFile)
   assert(sha256(raw) === pointer.sha256, 'State generation hash mismatch', 'STATE_GENERATION_CORRUPT')
-  const state = JSON.parse(raw)
+  let state = JSON.parse(raw)
   assert(state.protocol === PROTOCOL_VERSION, `Unsupported protocol ${state.protocol}`, 'PROTOCOL_VERSION_UNSUPPORTED')
   assert(Number.isInteger(state.generation) && state.generation === pointer.generation, 'State and pointer generation differ', 'STATE_GENERATION_CORRUPT')
-  return { state, pointer, generationFile }
+  const schemaVersion = state.schemaVersion || 1
+  assert([1, STATE_SCHEMA_VERSION].includes(schemaVersion), `Unsupported state schema ${schemaVersion}`, 'STATE_SCHEMA_UNSUPPORTED')
+  if (schemaVersion === 1) {
+    state = {
+      ...state,
+      schemaVersion: STATE_SCHEMA_VERSION,
+      migratedFromSchemaVersion: 1,
+      repo: {
+        ...state.repo,
+        projectId: state.repo?.projectId || `project-${sha256(state.repo?.canonicalRemote || state.repo?.repoId || '').slice(0, 20)}`
+      },
+      recordLayout: state.recordLayout || 'vault',
+      profile: state.profile || null,
+      relinkHistory: state.relinkHistory || []
+    }
+  }
+  return { state, pointer, generationFile, sourceSchemaVersion: schemaVersion }
 }
 
 export function writeState(paths, previous, nextState) {
@@ -518,12 +617,18 @@ export function writeState(paths, previous, nextState) {
   } else {
     assert(!current, 'State was created concurrently', 'STATE_CAS_CONFLICT')
   }
+  const recordLayout = nextState.recordLayout || 'vault'
+  const initialWrite = !previous && !current
+  validateVaultStructure(paths, { create: initialWrite })
+  secureVaultDirectory(paths, paths.state, { create: initialWrite })
+  secureVaultDirectory(paths, paths.generations, { create: initialWrite })
+  if (recordLayout !== 'vault') secureVaultDirectory(paths, recordLayout === 'markdown' ? paths.markdownContext : paths.portableContext, { create: true })
   const priorState = current?.state || null
   const generation = (priorState?.generation || 0) + 1
   const state = {
     ...nextState,
     protocol: PROTOCOL_VERSION,
-    schemaVersion: 1,
+    schemaVersion: STATE_SCHEMA_VERSION,
     generation,
     parentGenerationHash: current?.pointer?.sha256 || null,
     updatedAt: nowIso()
@@ -536,6 +641,8 @@ export function writeState(paths, previous, nextState) {
   const pointer = { protocol: PROTOCOL_VERSION, generation, file, sha256: generationHash, updatedAt: nowIso() }
   writeJsonAtomic(paths.currentPointer, pointer)
   atomicWrite(paths.projectContext, renderProjectContext(state, pointer))
+  atomicWrite(paths.projectProfile, renderProjectProfile(state, pointer))
+  renderRecordLayoutViews(paths, state, pointer)
   renderKnowledgeViews(paths, state)
   const architectureView = renderArchitectureView(paths, state)
   if (architectureView !== null) atomicWrite(paths.architecture, architectureView)
@@ -543,6 +650,7 @@ export function writeState(paths, previous, nextState) {
 }
 
 export function withStateLock(paths, callback) {
+  secureVaultDirectory(paths, paths.locks, { create: true })
   return withOwnedLockFile(path.join(paths.locks, 'state.lock'), callback)
 }
 
@@ -561,6 +669,7 @@ export function createRun(paths, stateBundle, observation, options = {}) {
   )
   const vaultSelection = {
     path: paths.vault,
+    recordLayout: options.vaultSelection.recordLayout || stateBundle.state.recordLayout || 'vault',
     currentUserSelectionDeclared: true,
     declarationScope: options.vaultSelection.declarationScope || 'current-session-explicit-path',
     operation: options.vaultSelection.operation || 'begin',
@@ -568,10 +677,10 @@ export function createRun(paths, stateBundle, observation, options = {}) {
     historicalOnly: true
   }
   const month = new Date().toISOString().slice(0, 7)
-  const runDir = ensureDir(path.join(paths.runs, month))
+  const runDir = secureVaultDirectory(paths, path.join(paths.runs, month), { create: true })
   const runFile = path.join(runDir, `${runId}.json`)
   const runMarkdown = path.join(runDir, `${runId}.md`)
-  const eventDir = ensureDir(path.join(paths.events, runId))
+  const eventDir = secureVaultDirectory(paths, path.join(paths.events, runId), { create: true })
   assert(!existsSync(runFile), `Run ${runId} already exists`, 'RUN_ALREADY_EXISTS')
   const run = {
     protocol: PROTOCOL_VERSION,
@@ -636,6 +745,7 @@ export function createRun(paths, stateBundle, observation, options = {}) {
     evidence: [],
     metadata: {
       vaultPath: vaultSelection.path,
+      recordLayout: vaultSelection.recordLayout,
       currentUserVaultSelectionDeclared: true,
       declarationScope: vaultSelection.declarationScope,
       declarationRecordedAt: vaultSelection.declarationRecordedAt
@@ -647,7 +757,7 @@ export function createRun(paths, stateBundle, observation, options = {}) {
   initialRun.eventSequence = 1
   initialRun.status = 'active'
   const activeRun = saveRunRecord(runFile, initialRun)
-  atomicWrite(runMarkdown, renderRun(activeRun, readEvents(eventDir)))
+  atomicWrite(runMarkdown, renderRun(activeRun, readEvents(paths, eventDir)))
   return { run: activeRun, runFile, runMarkdown, eventDir }
 }
 
@@ -666,31 +776,36 @@ export function renewRunLease(paths, runId, options = {}) {
     recorderPid: found.run.lease.holder?.recorderPid || found.run.recorderPid
   })
   found.run = saveRunRecord(found.runFile, found.run)
-  atomicWrite(found.runMarkdown, renderRun(found.run, readEvents(found.eventDir)))
+  atomicWrite(found.runMarkdown, renderRun(found.run, readEvents(paths, found.eventDir)))
   return { run: found.run, lease: runLeaseStatus(found.run) }
 }
 
 export function findRun(paths, runId) {
   assertSafeId(runId, 'run ID')
   if (!existsSync(paths.runs)) return null
+  secureVaultDirectory(paths, paths.runs)
   for (const month of readdirSync(paths.runs, { withFileTypes: true })) {
-    if (!month.isDirectory()) continue
-    const candidate = path.join(paths.runs, month.name, `${runId}.json`)
+    assert(!month.isSymbolicLink(), `Run month ${month.name} must not be a link or junction`, 'VAULT_PATH_UNSAFE')
+    if (!month.isDirectory() || !/^\d{4}-\d{2}$/.test(month.name)) continue
+    const monthDirectory = secureVaultDirectory(paths, path.join(paths.runs, month.name))
+    const candidate = path.join(monthDirectory, `${runId}.json`)
     if (existsSync(candidate)) {
+      const raw = readSecureVaultFile(paths, candidate)
       return {
         runFile: candidate,
         runMarkdown: candidate.replace(/\.json$/i, '.md'),
         eventDir: path.join(paths.events, runId),
-        run: readJson(candidate)
+        run: JSON.parse(raw)
       }
     }
   }
   return null
 }
 
-export function readEvents(eventDir) {
+export function readEvents(paths, eventDir) {
   if (!existsSync(eventDir)) return []
-  return readdirSync(eventDir).filter((name) => /^\d{6}\.json$/.test(name)).sort().map((name) => readJson(path.join(eventDir, name)))
+  secureVaultDirectory(paths, eventDir)
+  return readdirSync(eventDir).filter((name) => /^\d{6}\.json$/.test(name)).sort().map((name) => JSON.parse(readSecureVaultFile(paths, path.join(eventDir, name))))
 }
 
 export function appendRunEvent(paths, runId, input) {
@@ -701,7 +816,8 @@ export function appendRunEvent(paths, runId, input) {
   assert(EVENT_TYPES.has(input.type), `Unsupported event type ${input.type}`, 'EVENT_TYPE_INVALID')
   assert(input.summary && String(input.summary).trim(), 'Event summary is required', 'EVENT_SUMMARY_REQUIRED')
   const sequence = found.run.eventSequence + 1
-  const priorEvents = readEvents(found.eventDir)
+  secureVaultDirectory(paths, found.eventDir)
+  const priorEvents = readEvents(paths, found.eventDir)
   let expectedPreviousHash = null
   for (const [index, prior] of priorEvents.entries()) {
     assertRecordHash(prior, 'eventHash', 'RUN_EVENT_CORRUPT')
@@ -736,7 +852,7 @@ export function appendRunEvent(paths, runId, input) {
   // Render from the canonical persisted representation. stableJson sorts object
   // keys, so rendering the pre-write object can otherwise make Markdown differ
   // from the immutable event when metadata has multiple insertion orders.
-  const persistedEvent = readJson(eventFile)
+  const persistedEvent = JSON.parse(readSecureVaultFile(paths, eventFile))
   found.run.eventSequence = sequence
   if (input.next) found.run.nextObjective = input.next
   found.run = saveRunRecord(found.runFile, found.run)
@@ -759,7 +875,7 @@ export function finishRun(paths, runId, status, observation, options = {}) {
   found.run.summary = options.summary || null
   found.run.nextObjective = options.next || found.run.nextObjective
   found.run = saveRunRecord(found.runFile, found.run)
-  atomicWrite(found.runMarkdown, renderRun(found.run, readEvents(found.eventDir)))
+  atomicWrite(found.runMarkdown, renderRun(found.run, readEvents(paths, found.eventDir)))
   return found.run
 }
 
@@ -774,6 +890,14 @@ function boundedMarkdownList(items, maximum = 12, itemLimit = 360) {
 function boundedInline(value, maximum = 360, fallback = 'Not recorded.') {
   const text = inlineMarkdown(value || fallback)
   return text.length <= maximum ? text : `${text.slice(0, maximum - 1)}…`
+}
+
+function boundedPortableInline(value, maximum = 360, fallback = 'Not recorded.') {
+  return boundedInline(redactSensitiveText(value), maximum, fallback)
+}
+
+function boundedPortableList(items, maximum = 12, itemLimit = 360) {
+  return boundedMarkdownList((items || []).map((item) => redactSensitiveText(typeof item === 'string' ? item : JSON.stringify(item))), maximum, itemLimit)
 }
 
 function evidenceSummary(evidence, maximum = 3) {
@@ -805,6 +929,114 @@ function progressSummary(claim) {
   if (claim?.environment) qualifiers.push(`environment: ${boundedInline(claim.environment, 80)}`)
   qualifiers.push(`evidence: ${evidenceSummary(claim?.evidence)}`)
   return `${boundedInline(claim?.type || 'claim', 80)}: ${boundedInline(claim?.status || 'inconclusive', 80)}${statement} (${qualifiers.join('; ')})`
+}
+
+function renderProjectProfile(state, pointer) {
+  const profile = state.profile || {}
+  const commands = (profile.keyCommands || []).slice(0, 12).map((item) => typeof item === 'string' ? item : `${item.name || 'command'}: ${item.command || ''}`)
+  const components = (profile.components || []).slice(0, 12).map((item) => typeof item === 'string' ? item : `${item.path || 'unknown'} — ${item.role || 'unclassified'}`)
+  const boundariesAndRisks = [...(profile.boundaries || []), ...(profile.risks || [])].slice(0, 12)
+  const output = `# Project Profile
+
+> Bounded orientation view derived from machine state generation ${state.generation}. It describes the project, not the current task, and never grants authorization. Repository-declared commands are candidates, not proof that they are safe or have run.
+
+## Identity
+
+- Project ID: \`${boundedPortableInline(state.repo.projectId || state.repo.repoId, 120)}\`
+- Name: ${boundedPortableInline(profile.name || path.basename(state.repo.root), 140)}
+- Repository role: ${boundedPortableInline(profile.repositoryRole || 'Not confirmed.', 220)}
+- Canonical remote: \`${boundedPortableInline(state.repo.canonicalRemote || 'none', 320)}\`
+- Record layout: \`${boundedInline(state.recordLayout || 'vault', 40)}\`
+
+## Purpose and audience
+
+- Summary: ${boundedPortableInline(profile.summary || 'Not confirmed.', 480)}
+- Purpose: ${boundedPortableInline(profile.purpose || profile.summary || 'Not confirmed.', 480)}
+- Audience: ${boundedPortableInline(profile.audience || 'Not confirmed.', 240)}
+
+## Components
+
+${boundedPortableList(components, 12, 220)}
+
+## Repository-declared command candidates
+
+${boundedPortableList(commands, 12, 220)}
+
+## Boundaries and risks
+
+${boundedPortableList(boundariesAndRisks, 12, 260)}
+
+## Provenance
+
+- Profile source: ${boundedPortableInline(profile.source || 'bounded repository-map inference; user confirmation not recorded', 260)}
+- Map version: \`${boundedInline(profile.mapVersion || state.map?.versionId || 'not recorded', 160)}\`
+- Profile updated: ${boundedInline(profile.updatedAt || state.updatedAt, 80)}
+- Machine authority: \`${pointer.file}\` (${pointer.sha256})
+- View budget: at most 12288 UTF-8 bytes; machine state remains authoritative.
+`
+  assert(Buffer.byteLength(output, 'utf8') <= 12 * 1024, 'Bounded Project Profile exceeded its hard byte budget', 'PROJECT_PROFILE_BUDGET_EXCEEDED')
+  return output
+}
+
+function renderPortableContext(state, pointer) {
+  const task = state.task
+  return `# Current Project Context
+
+> Portable bounded view. Machine state remains authoritative. This file contains no evidence bodies and no archived authorization text.
+
+- Project ID: \`${boundedPortableInline(state.repo.projectId || state.repo.repoId, 120)}\`
+- Branch / HEAD: \`${boundedPortableInline(state.observation.branch || 'DETACHED', 160)}\` / \`${state.observation.head}\`
+- Trust: **${state.trust.status}**
+- Current task: ${task ? `\`${boundedPortableInline(task.id, 120)}\` — ${boundedPortableInline(task.title, 220)}` : 'Not recorded.'}
+- Objective: ${boundedPortableInline(task?.objective, 500)}
+- Requirement: ${boundedPortableInline(task?.requirement, 500)}
+- Stage: \`${boundedInline(state.stage, 80)}\`
+- Next objective: ${boundedPortableInline(state.nextObjective, 500)}
+- Open blockers: ${(state.blockers || []).filter((item) => item.taskId === task?.id && item.status !== 'resolved').length}
+- State generation: ${state.generation} / \`${pointer.sha256}\`
+- Updated: ${state.updatedAt}
+`
+}
+
+function recordLayoutViewArtifacts(paths, state, pointer) {
+  const layout = state.recordLayout || 'vault'
+  if (layout === 'vault') return null
+  const target = layout === 'markdown' ? paths.markdownContext : paths.portableContext
+  const profile = renderProjectProfile(state, pointer)
+  const current = renderPortableContext(state, pointer)
+  const readme = `# Project Context Records\n\nLayout: \`${layout}\`. Start with \`PROJECT_PROFILE.md\`, then \`CURRENT_CONTEXT.md\`. Daily summaries are user-triggered and stored under \`daily/\`. Full machine JSON remains the integrity, concurrency, event, and evidence authority in this selected context store.\n`
+  const files = {
+    'PROJECT_PROFILE.md': profile,
+    'CURRENT_CONTEXT.md': current,
+    'README.md': readme,
+    'RECORD_LAYOUT.json': stableJson({
+    protocol: 'project-context/record-layout/v2',
+    layout,
+    projectId: state.repo.projectId || state.repo.repoId,
+    repoId: state.repo.repoId,
+    workspaceId: state.repo.workspaceId,
+    contextId: state.repo.contextId,
+    stateGeneration: state.generation,
+    stateHash: pointer.sha256,
+    artifactHashes: {
+      projectProfile: sha256(profile),
+      currentContext: sha256(current),
+      readme: sha256(readme)
+    },
+    updatedAt: state.updatedAt
+    })
+  }
+  return { layout, target, files }
+}
+
+function renderRecordLayoutViews(paths, state, pointer) {
+  const artifacts = recordLayoutViewArtifacts(paths, state, pointer)
+  if (!artifacts) return
+  secureVaultDirectory(paths, artifacts.target, { create: true })
+  for (const [name, content] of Object.entries(artifacts.files)) {
+    secureVaultDirectory(paths, artifacts.target)
+    atomicWrite(path.join(artifacts.target, name), content)
+  }
 }
 
 function renderProjectContext(state, pointer) {
@@ -1005,7 +1237,7 @@ function renderKnowledgeViews(paths, state) {
   atomicWrite(paths.issues, `# Open Issues and Pitfalls\n\n> Derived from machine state. IDs and event references resolve to immutable machine records.\n\n## Open blockers\n\n${openBlockers.join('\n') || '- None.'}\n\n## Pitfalls\n\n${pitfalls.join('\n') || '- None.'}\n`)
   const decisions = []
   for (const entry of listRuns(paths)) {
-    for (const event of readEvents(path.join(paths.events, entry.run.runId))) {
+    for (const event of readEvents(paths, path.join(paths.events, entry.run.runId))) {
       if (!['decision', 'authorization'].includes(event.type)) continue
       decisions.push(`- \`${inlineMarkdown(event.eventId)}\` / run \`${inlineMarkdown(entry.run.runId)}\` / ${event.observedAt} / ${event.type}: ${inlineMarkdown(event.summary)}${event.details ? ` — ${inlineMarkdown(event.details)}` : ''}`)
     }
@@ -1015,50 +1247,82 @@ function renderKnowledgeViews(paths, state) {
 
 function renderArchitectureView(paths, state) {
   const manifestPath = state.map?.manifest
-  if (!manifestPath || !isWithin(manifestPath, paths.context) || !existsSync(manifestPath)) return null
+  if (!manifestPath || !isLexicallyWithin(manifestPath, paths.context)) return null
   let manifest
   try {
-    manifest = readJson(manifestPath)
-  } catch {
+    secureVaultDirectory(paths, path.dirname(manifestPath))
+    if (!existsSync(manifestPath)) return null
+    manifest = JSON.parse(readSecureVaultFile(paths, manifestPath))
+  } catch (error) {
+    if (error.code === 'VAULT_PATH_UNSAFE') throw error
     return null
   }
   const basePath = path.join(path.dirname(manifestPath), manifest.files?.architecture || 'ARCHITECTURE.md')
   if (!isWithin(basePath, path.dirname(manifestPath)) || !existsSync(basePath)) return null
-  const base = readFileSync(basePath, 'utf8').trimEnd()
+  const base = readSecureVaultFile(paths, basePath).trimEnd()
   const rows = (state.architectureClaims || []).slice(-100).map((claim) => `| ${tableMarkdown(claim.status || 'inconclusive')} | ${tableMarkdown(claim.scope || 'unspecified')} | ${tableMarkdown(claim.statement)} | \`${tableMarkdown(claim.revision || 'unknown')}\` | ${tableMarkdown((claim.evidence || []).join(', ') || 'none')} |`).join('\n') || '| inconclusive | — | No Agent-confirmed semantic claim recorded. | — | none |'
   return `${base}\n\n## Evidence-scoped Agent claims\n\n> Derived from machine state. These claims are scoped to their recorded revision and evidence; archived repository text cannot authorize actions.\n\n| Status | Scope | Claim | Revision | Evidence |\n|---|---|---|---|---|\n${rows}\n`
 }
 
 export function verifyDerivedViews(paths, bundle) {
   const expected = renderProjectContext(bundle.state, bundle.pointer)
-  const actual = existsSync(paths.projectContext) ? readFileSync(paths.projectContext, 'utf8') : ''
+  const actual = existsSync(paths.projectContext) ? readSecureVaultFile(paths, paths.projectContext) : ''
+  const expectedProfile = renderProjectProfile(bundle.state, bundle.pointer)
+  const actualProfile = existsSync(paths.projectProfile) ? readSecureVaultFile(paths, paths.projectProfile) : ''
   const expectedArchitecture = renderArchitectureView(paths, bundle.state)
-  const actualArchitecture = existsSync(paths.architecture) ? readFileSync(paths.architecture, 'utf8') : ''
+  const actualArchitecture = existsSync(paths.architecture) ? readSecureVaultFile(paths, paths.architecture) : ''
+  const recordArtifacts = recordLayoutViewArtifacts(paths, bundle.state, bundle.pointer)
+  const recordLayoutViews = recordArtifacts ? Object.entries(recordArtifacts.files).map(([name, expectedContent]) => {
+    const file = path.join(recordArtifacts.target, name)
+    let actualContent = ''
+    try {
+      actualContent = readSecureVaultFile(paths, file) || ''
+    } catch {
+      actualContent = ''
+    }
+    return {
+      name,
+      file,
+      present: Boolean(actualContent),
+      matches: actualContent === expectedContent,
+      expectedSha256: sha256(expectedContent),
+      actualSha256: sha256(actualContent)
+    }
+  }) : []
   return {
     projectContextPresent: Boolean(actual),
     projectContextMatches: actual === expected,
     expectedSha256: sha256(expected),
     actualSha256: sha256(actual),
+    projectProfilePresent: Boolean(actualProfile),
+    projectProfileMatches: actualProfile === expectedProfile,
+    projectProfileExpectedSha256: sha256(expectedProfile),
+    projectProfileActualSha256: sha256(actualProfile),
     architectureExpected: expectedArchitecture !== null,
     architectureMatches: expectedArchitecture === null ? false : actualArchitecture === expectedArchitecture,
     architectureExpectedSha256: expectedArchitecture === null ? null : sha256(expectedArchitecture),
-    architectureActualSha256: sha256(actualArchitecture)
+    architectureActualSha256: sha256(actualArchitecture),
+    recordLayoutExpected: Boolean(recordArtifacts),
+    recordLayout: recordArtifacts?.layout || 'vault',
+    recordLayoutTarget: recordArtifacts?.target || null,
+    recordLayoutViews,
+    recordLayoutViewsMatch: recordLayoutViews.every((item) => item.present && item.matches)
   }
 }
 
 export function refreshRunView(paths, runId) {
   const found = findRun(paths, runId)
   assert(found, `Run ${runId} was not found`, 'RUN_NOT_FOUND')
-  atomicWrite(found.runMarkdown, renderRun(found.run, readEvents(found.eventDir)))
+  atomicWrite(found.runMarkdown, renderRun(found.run, readEvents(paths, found.eventDir)))
   return found
 }
 
 export function verifyRunView(paths, runId) {
   const found = findRun(paths, runId)
   assert(found, `Run ${runId} was not found`, 'RUN_NOT_FOUND')
-  const events = readEvents(found.eventDir)
+  const events = readEvents(paths, found.eventDir)
   const expected = renderRun(found.run, events)
-  const actual = existsSync(found.runMarkdown) ? readFileSync(found.runMarkdown, 'utf8') : ''
+  const actual = existsSync(found.runMarkdown) ? readSecureVaultFile(paths, found.runMarkdown) : ''
   let previousEventHash = null
   const hashChainValid = events.every((event, index) => {
     try {
@@ -1094,15 +1358,28 @@ export function verifyRunView(paths, runId) {
 export function listRuns(paths) {
   const results = []
   if (!existsSync(paths.runs)) return results
+  secureVaultDirectory(paths, paths.runs)
   for (const month of readdirSync(paths.runs, { withFileTypes: true })) {
-    if (!month.isDirectory()) continue
-    for (const name of readdirSync(path.join(paths.runs, month.name))) {
+    assert(!month.isSymbolicLink(), `Run month ${month.name} must not be a link or junction`, 'VAULT_PATH_UNSAFE')
+    if (!month.isDirectory() || !/^\d{4}-\d{2}$/.test(month.name)) continue
+    const monthDirectory = secureVaultDirectory(paths, path.join(paths.runs, month.name))
+    for (const name of readdirSync(monthDirectory)) {
       if (!name.endsWith('.json')) continue
-      const runFile = path.join(paths.runs, month.name, name)
-      results.push({ runFile, run: readJson(runFile) })
+      const runFile = path.join(monthDirectory, name)
+      results.push({ runFile, run: JSON.parse(readSecureVaultFile(paths, runFile)) })
     }
   }
-  return results.sort((a, b) => a.run.startedAt.localeCompare(b.run.startedAt))
+  return results.sort((a, b) => {
+    const left = `${a.run.startedAt || ''}\0${a.run.runId || ''}`
+    const right = `${b.run.startedAt || ''}\0${b.run.runId || ''}`
+    return left < right ? -1 : left > right ? 1 : 0
+  })
 }
 
-export { EVENT_TYPES, RUN_STATUSES, renderArchitectureView, renderProjectContext, renderRun }
+export function readRunEvents(paths, runId) {
+  const found = findRun(paths, runId)
+  assert(found, `Run ${runId} was not found`, 'RUN_NOT_FOUND')
+  return readEvents(paths, found.eventDir)
+}
+
+export { EVENT_TYPES, RUN_STATUSES, renderArchitectureView, renderProjectContext, renderProjectProfile, renderRun }

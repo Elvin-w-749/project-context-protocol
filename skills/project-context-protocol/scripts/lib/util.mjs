@@ -192,6 +192,11 @@ export function isWithin(child, parent) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
+export function isLexicallyWithin(child, parent) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child))
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
+}
+
 export function assert(condition, message, code = 'ASSERTION_FAILED') {
   if (condition) return
   const error = new Error(message)
@@ -213,6 +218,31 @@ export function safeMarkdown(value) {
 
 export function inlineMarkdown(value) {
   return safeMarkdown(value).replace(/\s*\n\s*/g, ' ').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/`/g, '\\`')
+}
+
+export function redactSensitiveText(value, { highEntropy = true } = {}) {
+  if (value === null || value === undefined) return value
+  const protocolIds = []
+  const protectProtocolIdentifier = (match) => {
+    const marker = `PCPID${protocolIds.length}END`
+    protocolIds.push(match)
+    return marker
+  }
+  let redacted = String(value)
+    .replace(/\bgeneration-\d{8}(?:-[a-f0-9]{12})?\.json\b/gi, protectProtocolIdentifier)
+    .replace(/\b(?:RUN|EVID|CLAIM|ARCH|ISSUE|TASK|PIT|MAP|EXPORT|IMPORT|DECISION|ATTEMPT|CORR|CHANGE)-[A-Za-z0-9_-]+\b/g, protectProtocolIdentifier)
+  redacted = redacted
+    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/gi, '[REDACTED_PRIVATE_KEY]')
+    .replace(/\b(?:github_pat_|gh[pousr]_|AKIA|ASIA)[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_CREDENTIAL]')
+    .replace(/\b(?:sk|ak|pk|rk)-[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED_CREDENTIAL]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, 'Bearer [REDACTED_TOKEN]')
+    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|cookie)\s*[:=]\s*)["']?[^\s,;"']+/gi, '$1[REDACTED]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]')
+    .replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, '[REDACTED_PHONE]')
+    .replace(/(?<!\d)\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx](?!\d)/g, '[REDACTED_ID]')
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[REDACTED_EMAIL]')
+  if (highEntropy) redacted = redacted.replace(/\b(?=[A-Za-z0-9_+/=-]{32,}\b)(?=[A-Za-z0-9_+/=-]*[A-Za-z])(?=[A-Za-z0-9_+/=-]*\d)[A-Za-z0-9_+/=-]+\b/g, '[REDACTED_HIGH_ENTROPY_TOKEN]')
+  return redacted.replace(/PCPID(\d+)END/g, (_, index) => protocolIds[Number(index)] || '[INVALID_PROTOCOL_ID]')
 }
 
 export function quoteMarkdown(value, empty = '> Not recorded.') {
